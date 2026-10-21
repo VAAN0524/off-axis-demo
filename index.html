@@ -209,8 +209,18 @@
       <input id="iDiag" type="range" min="13" max="49" step="1" value="27" />
     </div>
 
-    <div class="ctl">
-      <div class="ctl-h"><span>照片层不透明度</span><output id="oOpac">100</output></div>
+    <div class="seg" id="segScene">
+      <button data-scene="depth" class="on">深度网格</button>
+      <button data-scene="cards">分层贴片</button>
+    </div>
+
+    <div class="ctl" data-for="depth">
+      <div class="ctl-h"><span>深度强度</span><output id="oStrength">1.00</output></div>
+      <input id="iStrength" type="range" min="0.2" max="2" step="0.05" value="1" />
+    </div>
+
+    <div class="ctl" data-for="cards">
+      <div class="ctl-h"><span>贴片不透明度</span><output id="oOpac">100</output></div>
       <input id="iOpac" type="range" min="15" max="100" step="1" value="100" />
     </div>
 
@@ -233,7 +243,7 @@
       <button id="btnYaw" disabled title="模型朝向不对时掰一下">旋转 90°</button>
     </div>
 
-    <p class="tip">三层照片按 0.48 / 1.05 / 1.85 m 摆放，边缘做了 alpha 羽化，所以前景会自然融进后面，遮挡关系仍是真遮挡。没有摄像头时鼠标 = 头部、滚轮 = 前后；把 .spz / .ply / .splat / .ksplat 拖进窗口可换任意 3DGS 场景。</p>
+    <p class="tip">「深度网格」是单张照片 + 逐像素深度（Depth Anything V2 离线估计）：每个顶点都有真实远近，所以视差是按像素连续的、遮挡也是真的，不是几张卡片平移。「分层贴片」是旧做法，切过去能直接看出贴纸感差在哪。</p>
   </div>
 </div>
 
@@ -276,7 +286,10 @@ const params = {
   diagonal: 27,    // 屏幕对角线（英寸）
   mirror: true,    // 前置摄像头未镜像，默认取反
   showTest: true,
-  foreOpaque: 1.0,  // 照片层不透明度（1 = 实心，越低越透）
+  scene: 'depth',      // 'depth' 深度网格 ｜ 'cards' 分层贴片（对比）
+  depthStrength: 1.0,  // 深度强度：压缩或夸张前后距离
+  cull: new URLSearchParams(location.search).get('cull') !== '0', // 剪影外三角面剔除
+  foreOpaque: 1.0,     // 贴片不透明度（1 = 实心，越低越透）
 };
 
 const state = {
@@ -424,6 +437,7 @@ function placeSplat() {
    每层是一张不透明照片，深度不同 → 视差位移 + 前后遮挡都能直接看出来
    ══════════════════════════════════════════════════════════════════ */
 let testGroup = null;
+let depthGroup = null;
 
 /**
  * 三层深度图例。颜色即该层照片的边框色，方便对着画面认层。
@@ -474,7 +488,7 @@ function roundRectPath(ctx, x, y, w, h, r) {
  *   2) 画一圈同色细边框，作为视差位移的参照
  *   3) 用 destination-in 乘一张柔边圆角蒙版 → 边缘真的透明
  */
-function makePhotoTexture(img, planeAspect, feather, tint) {
+function makeCardTexture(img, planeAspect, feather, tint) {
   const W = Math.min(1600, img.width || 1024);
   const H = Math.max(1, Math.round(W / planeAspect));
   const cv = document.createElement('canvas');
@@ -539,7 +553,7 @@ function buildPhotoLayer({ src, remote, z, w, h, x, y, color, dim, feather, orde
 
   const apply = (img) => {
     if (!img?.width) return;
-    mat.map = makePhotoTexture(img, w / h, feather, color);
+    mat.map = makeCardTexture(img, w / h, feather, color);
     mat.color.setScalar(dim);
     mat.opacity = params.foreOpaque;
     mat.needsUpdate = true;
@@ -571,6 +585,370 @@ function buildBackdrop() {
   return mesh;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   测试场景 A（默认）：单张照片 + 逐像素深度网格
+   ──────────────────────────────────────────────────────────────────
+   深度图用 Depth Anything V2 (small, ONNX) 离线算好，打包成普通
+   script（depth/near_depth.js，uint16 base64），所以不联网、不受
+   CORS 限制，file:// 打开也能用。
+   运行时只做两件事：
+     1) 顶点 z = -depthToZ(该像素深度)
+     2) 顶点 x/y 按针孔关系缩放：x = sx * z / zRef
+   第 2 步是关键：它保证「眼睛在参考距离时，照片逐像素对齐屏幕」，
+   于是头动起来近处的桌子位移大、远处的墙位移小，而且是连续的
+   曲面在动，不是几块卡片整块平移 —— 贴纸感就是这么消掉的。
+   ══════════════════════════════════════════════════════════════════ */
+const DEPTH_SCENE = {
+  photo: 'img/near.jpg',
+  photoRemote: 'https://picsum.photos/id/48/960/600',
+  zRef: 0.60,   // 参考眼距：此距离上照片正好铺满屏幕
+  zNear: 0.40,  // 最近像素落在屏幕后 40cm
+  zFar: 3.20,   // 最远像素
+  margin: 0.45, // 裙边：向外各扩 45% 半屏宽，头动时补边
+  segX: 240,
+  segY: 150,
+  pad: 0.20,    // 贴图四周多铺一圈延伸图，画面边缘不会拉出亮线
+};
+
+/**
+ * 只有两层：一张满幅的背景板 + 一个按剪影抠出来的近景。
+ * 为什么不是一张连续网格：连续网格上「笔电 0.5m → 墙 3m」那条深度断层
+ * 会被三角面拉成一张橡皮布，头一偏就液化。切开以后每层内部的深度只在自己
+ * 那一段里变（近景 0.40–0.66m、远景 0.66–3.2m），跨轮廓的拉伸就没了。
+ *
+ * 远景板是离线补过的（depth/near_plate.jpg 把近景挡住的区域填掉了），
+ * 所以它不含笔电轮廓；近景挪开时露出来的也是像样的虚焦像素，不是黑洞。
+ */
+const DEPTH_LAYERS = [
+  {
+    label: '远景', d0: 0.00, d1: 0.55, order: 0,
+    tex: 'depth/near_plate.jpg', texRemote: null,
+    depthKind: 'png', depthSrc: 'depth/near_plate_depth.png',
+    mask: null,
+  },
+  {
+    label: '近景', d0: 0.55, d1: 1.00, order: 2,
+    tex: 'photo', texRemote: null,
+    // 这份深度是离线补过边的：近景区间内的值一直延伸到剪影之外，
+    // 所以剪影处没有落差 → 不会出现"橡皮斜坡"，alpha 能干净地切开
+    depthKind: 'png', depthSrc: 'depth/near_layer_depth.png',
+    mask: 'depth/near_mask_near.png',
+  },
+];
+
+const depthState = {
+  group: null,
+  layers: [],
+  layout: null,
+  dims: null,   // 深度图尺寸，图例用
+  ready: false,
+  failed: false,
+};
+
+const smoothstep = (e0, e1, x) => {
+  const t = THREE.MathUtils.clamp((x - e0) / Math.max(1e-6, e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+/** 采样 0..1 深度（0 = 最远，1 = 最近），双线性 */
+function sampleDepth(d, u, v) {
+  const x = THREE.MathUtils.clamp(u, 0, 1) * (d.w - 1);
+  const y = THREE.MathUtils.clamp(v, 0, 1) * (d.h - 1);
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const x1 = Math.min(d.w - 1, x0 + 1), y1 = Math.min(d.h - 1, y0 + 1);
+  const fx = x - x0, fy = y - y0;
+  const p = d.data;
+  const a = p[y0 * d.w + x0], b = p[y0 * d.w + x1];
+  const c = p[y1 * d.w + x0], e = p[y1 * d.w + x1];
+  return (a + (b - a) * fx) * (1 - fy) + (c + (e - c) * fx) * fy;
+}
+
+/**
+ * 深度 → 米。视差和 1/z 成正比，所以中间用倒数插值，
+ * 否则整张图会像"台阶"一样往前挤。
+ */
+function depthToZ(d) {
+  const s = params.depthStrength;
+  const zN = DEPTH_SCENE.zRef - (DEPTH_SCENE.zRef - DEPTH_SCENE.zNear) * s;
+  const zF = DEPTH_SCENE.zRef + (DEPTH_SCENE.zFar - DEPTH_SCENE.zRef) * s;
+  const invN = 1 / zN, invF = 1 / zF;
+  return 1 / (invF + (invN - invF) * d);
+}
+
+/** 8bit 灰度深度图（PNG）→ 0..1 */
+function loadGrayDepth(url) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const cv = document.createElement('canvas');
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      const px = ctx.getImageData(0, 0, cv.width, cv.height).data;
+      const n = cv.width * cv.height;
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = px[i * 4] / 255;
+      res({ w: cv.width, h: cv.height, data: out });
+    };
+    img.onerror = () => rej(new Error('深度图加载失败：' + url));
+    img.src = url;
+  });
+}
+
+/** 所有贴图共用一套布局：内容区 Wc×Hc 居中，四周 pad */
+function computeLayout(aspect, pad) {
+  const Wc = 960;
+  const Hc = Math.max(1, Math.round(Wc / aspect));
+  const padX = Math.round(Wc * pad), padY = Math.round(Hc * pad);
+  return { Wc, Hc, padX, padY, W: Wc + padX * 2, H: Hc + padY * 2 };
+}
+
+/** 把小图画进大图中央，四周用 1px 边拉伸补满（= 边缘钳制） */
+function drawEdgeClamped(ctx, src, dx, dy, dw, dh) {
+  const sw = src.width || src.naturalWidth, sh = src.height || src.naturalHeight;
+  const W = ctx.canvas.width, H = ctx.canvas.height;
+  const padL = dx, padT = dy;
+  const padR = W - (dx + dw), padB = H - (dy + dh);
+  ctx.drawImage(src, 0, 0, sw, sh, dx, dy, dw, dh);
+  if (padL > 0) ctx.drawImage(src, 0, 0, 1, sh, 0, dy, padL, dh);
+  if (padR > 0) ctx.drawImage(src, sw - 1, 0, 1, sh, dx + dw, dy, padR, dh);
+  if (padT > 0) ctx.drawImage(src, 0, 0, sw, 1, dx, 0, dw, padT);
+  if (padB > 0) ctx.drawImage(src, 0, sh - 1, sw, 1, dx, dy + dh, dw, padB);
+  if (padL > 0 && padT > 0) ctx.drawImage(src, 0, 0, 1, 1, 0, 0, padL, padT);
+  if (padR > 0 && padT > 0) ctx.drawImage(src, sw - 1, 0, 1, 1, dx + dw, 0, padR, padT);
+  if (padL > 0 && padB > 0) ctx.drawImage(src, 0, sh - 1, 1, 1, 0, dy + dh, padL, padB);
+  if (padR > 0 && padB > 0) ctx.drawImage(src, sw - 1, sh - 1, 1, 1, dx + dw, dy + dh, padR, padB);
+}
+
+/**
+ * 照片 → 贴图：中间清晰（cover 裁切），四周 pad 先铺一层放大 + 模糊的同图，
+ * 作为"照片之外"的自然延伸。裙子边缘就不会拉成一条条亮线，而是像虚焦延续。
+ */
+function makePhotoTexture(img, L, blurPad) {
+  const { Wc, Hc, padX, padY, W, H } = L;
+  const cc = document.createElement('canvas');
+  cc.width = Wc; cc.height = Hc;
+  const cx = cc.getContext('2d');
+  const aspect = Wc / Hc;
+  const ia = (img.width || 1) / (img.height || 1);
+  let sx = 0, sy = 0, sw = img.width, sh = img.height;
+  if (ia > aspect) { sw = img.height * aspect; sx = (img.width - sw) / 2; }
+  else { sh = img.width / aspect; sy = (img.height - sh) / 2; }
+  cx.drawImage(img, sx, sy, sw, sh, 0, 0, Wc, Hc);
+
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  if (blurPad) {
+    const k = Math.max(W / Wc, H / Hc) * 1.08;
+    const dw = Wc * k, dh = Hc * k;
+    if (typeof ctx.filter === 'string') ctx.filter = `blur(${Math.round(W * 0.014)}px)`;
+    ctx.drawImage(cc, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    if (typeof ctx.filter === 'string') ctx.filter = 'none';
+  } else {
+    drawEdgeClamped(ctx, cc, padX, padY, Wc, Hc);
+  }
+  ctx.drawImage(cc, padX, padY);
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAniso;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  return tex;
+}
+
+/** 剪影遮罩（白 = 该层实心）→ 贴图，四周边缘钳制，不然和画面边缘会错开一条缝 */
+function makeMaskTexture(img, L) {
+  const cv = document.createElement('canvas');
+  cv.width = L.W; cv.height = L.H;
+  const ctx = cv.getContext('2d');
+  drawEdgeClamped(ctx, img, L.padX, L.padY, L.Wc, L.Hc);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.anisotropy = maxAniso;
+  // 不要 mipmap：近景剪影处是一道很陡的坡，UV 变化极快，采样会掉到很粗的
+  // mip 上，粗 mip 里遮罩边缘是台阶 → 屏幕上就是被啃掉一块的锯齿。
+  tex.generateMipmaps = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+/** 遮罩图 → 0..1 采样场（用来把剪影外的三角面剔掉） */
+function loadMaskField(img) {
+  const cv = document.createElement('canvas');
+  cv.width = img.width || img.naturalWidth;
+  cv.height = img.height || img.naturalHeight;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const px = ctx.getImageData(0, 0, cv.width, cv.height).data;
+  const n = cv.width * cv.height;
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = px[i * 4] / 255;
+  return { w: cv.width, h: cv.height, data };
+}
+
+/** 网格骨架：屏幕空间坐标 + 该层深度 + 贴图 UV */
+function buildGridCache(L, depth, maskField) {
+  const { segX, segY, margin } = DEPTH_SCENE;
+  const nx = segX + 1, ny = segY + 1;
+  const count = nx * ny;
+  const NX = new Float32Array(count);
+  const NY = new Float32Array(count);
+  const DD = new Float32Array(count);
+  const uv = new Float32Array(count * 2);
+  const col = new Float32Array(count * 3);
+  const am = new Float32Array(count);
+  const lay = depthState.layout;
+
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const gx = (i / segX * 2 - 1) * (1 + margin);
+      const gy = (1 - j / segY * 2) * (1 + margin);
+      NX[k] = gx; NY[k] = gy;
+
+      const u = gx * 0.5 + 0.5;
+      const v = (1 - gy) * 0.5;
+      // 裙边不强行拉回远景（那会在照片边缘立一堵墙，一偏头就拉丝），
+      // 而是沿用边缘像素的深度，让画面自然延伸出去
+      DD[k] = sampleDepth(depth, u, v);
+      am[k] = maskField ? sampleDepth(maskField, u, v) : 1;
+
+      uv[k * 2] = (lay.padX + u * lay.Wc) / lay.W;
+      uv[k * 2 + 1] = 1 - (lay.padY + v * lay.Hc) / lay.H;
+
+      // 裙边不再压暗：压暗会在"近景裙边"和"背景板"之间露出一道亮度缝，
+      // 比拉丝本身更显眼。留着顶点色属性，方便以后想加别的调制。
+      col[k * 3] = col[k * 3 + 1] = col[k * 3 + 2] = 1;
+    }
+  }
+
+  // 有剪影的层：深度场抹平几格。剪影处深度是断的，网格一粗就成了一道
+  // 几像素宽的脊，侧看会把边缘像素拉成波浪缺口。抹平后脊变成缓坡。
+  // 剪影外的格子不生成三角面：否则那些面会横跨深度断层，侧看就是一条
+  // 被拉长的"橡皮带"。跨在边界上的格子保留，交给 alpha 去切。
+  const idx = [];
+  for (let j = 0; j < segY; j++) {
+    for (let i = 0; i < segX; i++) {
+      const a = j * nx + i, b = a + 1, c = a + nx, e = c + 1;
+      if (maskField && Math.max(am[a], am[b], am[c], am[e]) < 0.02) continue;
+      idx.push(a, c, b, b, c, e);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(new THREE.Uint32BufferAttribute(idx, 1));
+  geo.userData = { NX, NY, DD, count };
+  return geo;
+}
+
+/** 按当前强度 / 屏幕尺寸摆顶点（拖滑杆、改对角线、resize 都会调） */
+function shapeDepthLayers() {
+  const zRef = DEPTH_SCENE.zRef;
+  const halfW = screen.w * 0.5;
+  const halfH = screen.h * 0.5;
+
+  for (const L of depthState.layers) {
+    const { NX, NY, DD, count } = L.geo.userData;
+    const pos = L.geo.attributes.position.array;
+    const { d0, d1 } = L.def;
+
+    for (let k = 0; k < count; k++) {
+      // 深度钳在本层区间里：层内不再有跨轮廓的断层
+      const dc = DD[k] < d0 ? d0 : (DD[k] > d1 ? d1 : DD[k]);
+      const z = depthToZ(dc);
+      /**
+       * 参考眼位 (0,0,zRef) 处，屏幕上 (sx,0) 这条视线延伸到深度 z 时落在
+       * sx * (zRef + z) / zRef —— 所以近处的东西在世界里是**变大**的。
+       * 写成 sx * z / zRef（把眼到屏幕当成眼到物体）会整张缩小、四周漏边。
+       */
+      const s = (zRef + z) / zRef;
+      pos[k * 3] = NX[k] * halfW * s;
+      pos[k * 3 + 1] = NY[k] * halfH * s;
+      pos[k * 3 + 2] = -z;
+    }
+    L.geo.attributes.position.needsUpdate = true;
+    L.geo.computeBoundingSphere();
+    L.geo.computeBoundingBox?.();
+  }
+}
+
+async function buildDepthScene() {
+  const grp = new THREE.Group();
+  grp.visible = false;
+
+  try {
+    const photo = await loadColorImage(DEPTH_SCENE.photo, DEPTH_SCENE.photoRemote);
+    depthState.layout = computeLayout(photo.width / photo.height, DEPTH_SCENE.pad);
+
+    for (const def of DEPTH_LAYERS) {
+      const texImg = def.tex === 'photo'
+        ? photo
+        : await loadColorImage(def.tex, def.texRemote);
+      const tex = makePhotoTexture(texImg, depthState.layout, true);
+
+      const depth = await loadGrayDepth(def.depthSrc);
+      depthState.dims = { w: depth.w, h: depth.h };
+
+      const maskImg = def.mask ? await loadColorImage(def.mask, null) : null;
+      const maskTex = maskImg ? makeMaskTexture(maskImg, depthState.layout) : null;
+      const maskField = maskImg ? loadMaskField(maskImg) : null;
+
+      const geo = buildGridCache(def, depth, params.cull && maskField);
+      const mat = new THREE.MeshBasicMaterial({
+        map: tex,
+        alphaMap: maskTex,
+        vertexColors: true,
+        transparent: !!maskTex,
+        depthWrite: false,
+        toneMapped: false,
+        // 近景层在剪影处是一道很陡的坡，从侧面看三角面会翻面 →
+        // 用 FrontSide 会被背面剔除啃出一排锯齿，所以两面都画
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.renderOrder = def.order;
+      mesh.frustumCulled = false;
+      grp.add(mesh);
+      depthState.layers.push({ def, geo, mesh, tex, maskTex });
+    }
+
+    depthState.ready = true;
+    shapeDepthLayers();
+  } catch (err) {
+    console.warn('[demo] 深度网格构建失败：', err);
+    depthState.failed = true;
+    if (params.scene === 'depth') {
+      setScene('cards');
+      toast('深度网格没起来，先退回分层贴片：' + (err?.message || err));
+    }
+  }
+
+  depthState.group = grp;
+  return grp;
+}
+
+/** 图片加载（本地 → 远端兜底），Promise 版 */
+function loadColorImage(src, remote) {
+  const one = (url) => new Promise((res, rej) => {
+    texLoader.load(url, (tex) => {
+      const img = tex.image;
+      tex.dispose();
+      if (!img?.width) { rej(new Error('空图')); return; }
+      res(img);
+    }, undefined, () => rej(new Error('加载失败：' + url)));
+  });
+  return one(src).catch(() => (remote ? one(remote) : Promise.reject(new Error('图片加载失败'))));
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   测试场景 B（对比用）：三层贴片
+   ══════════════════════════════════════════════════════════════════ */
 function buildTestScene() {
   const g = new THREE.Group();
   g.add(buildBackdrop());
@@ -580,14 +958,29 @@ function buildTestScene() {
 
 function buildLegend() {
   const box = document.getElementById('legend');
+  if (!box) return;
+  if (params.scene === 'depth' && depthState.ready) {
+    const colors = ['#FF5C7A', '#FFD23F', '#7B61FF'];
+    const rows = DEPTH_LAYERS.map((L, i) => {
+      const zn = depthToZ(L.d1), zf = depthToZ(L.d0);
+      return `<div class="lg"><i style="background:${colors[L.label] || '#888'}"></i><span>${L.label} ${zn.toFixed(2)}–${zf.toFixed(2)} m</span></div>`;
+    }).reverse();
+    const dim = depthState.dims || { w: 0, h: 0 };
+    rows.unshift(`<div class="lg"><i style="background:#fff"></i><span>逐像素深度 ${dim.w}×${dim.h}</span></div>`);
+    box.innerHTML = rows.join('');
+    return;
+  }
   box.innerHTML = LEGEND
     .map((l) => `<div class="lg"><i style="background:${l.color}"></i><span>${l.text}</span></div>`)
     .join('');
 }
 
 function applyTestVisibility() {
-  if (testGroup) testGroup.visible = params.showTest;
-  document.getElementById('legend').classList.toggle('hidden', !params.showTest);
+  const on = params.showTest;
+  if (testGroup) testGroup.visible = on && params.scene === 'cards';
+  if (depthGroup) depthGroup.visible = on && params.scene === 'depth';
+  document.getElementById('legend').classList.toggle('hidden', !on);
+  buildLegend();
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1070,6 +1463,18 @@ function setMode(mode) {
   }
 }
 
+/** 场景切换：深度网格 ↔ 分层贴片。参数区跟着显隐，别让面板堆成一片。 */
+function setScene(mode) {
+  params.scene = mode;
+  for (const b of document.querySelectorAll('#segScene button')) {
+    b.classList.toggle('on', b.dataset.scene === mode);
+  }
+  for (const el of document.querySelectorAll('#panel [data-for]')) {
+    el.style.display = el.dataset.for === mode ? '' : 'none';
+  }
+  applyTestVisibility();
+}
+
 function resetAll() {
   target.x = 0; target.y = 0; target.z = 0.6;
   eye.x = 0; eye.y = 0; eye.z = 0.6;
@@ -1090,6 +1495,18 @@ function bindUI() {
     document.getElementById('oSens').textContent = params.sensitivity.toFixed(2);
   });
 
+  for (const b of document.querySelectorAll('#segScene button')) {
+    b.addEventListener('click', () => setScene(b.dataset.scene));
+  }
+
+  const iStrength = document.getElementById('iStrength');
+  iStrength.addEventListener('input', () => {
+    params.depthStrength = +iStrength.value;
+    document.getElementById('oStrength').textContent = params.depthStrength.toFixed(2);
+    shapeDepthLayers();
+    buildLegend();
+  });
+
   const iSm = document.getElementById('iSm');
   iSm.addEventListener('input', () => {
     params.smoothing = +iSm.value;
@@ -1102,6 +1519,7 @@ function bindUI() {
     params.diagonal = +iDiag.value;
     document.getElementById('oDiag').textContent = params.diagonal + '″';
     updateScreenSize();
+    shapeDepthLayers();
   });
 
   const iOpac = document.getElementById('iOpac');
@@ -1184,11 +1602,13 @@ function bindUI() {
     }
   });
 
-  /* 无摄像头时的降级输入：鼠标 / 滚轮 */
+  /* 无摄像头时的降级输入：鼠标 / 滚轮
+     鼠标只映射到 ±14cm 左右，别让人一下把眼位拖到屏幕边缘 ——
+     单目深度看不到被遮挡的像素，眼位离得太远就必然要补洞。 */
   addEventListener('pointermove', (e) => {
     if (state.live) return;
-    target.x = (e.clientX / innerWidth - 0.5) * screen.w * 1.1;
-    target.y = -(e.clientY / innerHeight - 0.5) * screen.h * 1.1;
+    target.x = (e.clientX / innerWidth - 0.5) * screen.w * 0.5;
+    target.y = -(e.clientY / innerHeight - 0.5) * screen.h * 0.5;
     target.z = state.pointerZ;
   }, { passive: true });
 
@@ -1228,6 +1648,7 @@ function bindUI() {
 
 addEventListener('resize', () => {
   updateScreenSize();
+  shapeDepthLayers();
   camera.aspect = innerWidth / innerHeight;
   if (params.mode === 'naive') camera.updateProjectionMatrix();
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -1268,15 +1689,20 @@ async function boot() {
   // 贴图各向异性上限（WebGPU / WebGL 都是这个方法，取不到就用 8）
   try { maxAniso = Math.min(8, renderer.getMaxAnisotropy?.() ?? 8); } catch { maxAniso = 8; }
 
-  // 2) 场景
+  // 2) 场景：贴片同步建，深度网格异步补（要读 1MB 深度图）
   updateScreenSize();
   testGroup = buildTestScene();
   scene.add(testGroup);
-  buildLegend();
-  applyTestVisibility();
+
+  buildDepthScene().then((g) => {
+    depthGroup = g;
+    scene.add(g);
+    applyTestVisibility();
+  });
 
   // 3) UI
   bindUI();
+  setScene(params.scene);
   applyFilterSettings();
   applyOffAxisCamera();
 
@@ -1297,8 +1723,9 @@ async function boot() {
 
   // 7) 留着给控制台调试：__parallax.ingest(landmarks) 可以喂假关键点
   window.__parallax = {
-    eye, target, calib, params, state, camera, scene,
-    ingest: ingestLandmarks, loadSplat, startTracking, setTrack, setTrackDetail,
+    eye, target, calib, params, state, camera, scene, screen,
+    depthState, depthToZ, shapeDepthLayers,
+    ingest: ingestLandmarks, loadSplat, startTracking, setTrack, setTrackDetail, setScene,
     setModel: (bytes) => { manualModelBuffer = bytes; },
   };
 }

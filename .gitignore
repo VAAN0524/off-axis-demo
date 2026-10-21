@@ -9,3 +9,7 @@
 # 本地临时文件
 *.log
 _frame_test.html
+
+# 深度模型（约 27MB，只在离线烘焙时用）
+model/
+img/*.bin
