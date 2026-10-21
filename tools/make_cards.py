@@ -182,9 +182,9 @@ def tone_match(fill, rgb, hole, ring_px=22, sigma=11.0):
 
 
 # ── 露出带：调和插值（迭代扩散），边界条件 = 洞外真实像素 ─────────────
-def harmonic_fill(rgb, src, band, iters=14):
+def harmonic_fill(rgb, src, band, iters=24):
     """
-    洞里每一轮做一次高斯，再把洞外强制恢复成原图：
+    multigrid 调和插值。洞里每一轮做一次高斯，再把洞外强制恢复成原图：
 
         out ← Gaussian(out)      只在洞内生效
         out ← rgb                洞外永远是真实像素
@@ -197,18 +197,51 @@ def harmonic_fill(rgb, src, band, iters=14):
       亮一大截 —— 左移时就是一块白板）；
     · **边界上严格等于原值**，不会有接缝、也不会有虚化描边。
 
-    两个参数是绑死的：sigma 取 band/4，迭代 14 轮 → 等效扩散半径
-    ≈ sigma·√14 ≈ 0.93·band，刚好覆盖整个洞。
+    **为什么必须 multigrid**：单尺度"σ·√N ≥ 洞半径就收敛"是错的 ——
+    那只是让扰动衰减，而洞的初值是**原图的笔电像素**，要把"笔电"洗成
+    "边界调和曲面"，信息必须从边界一路传到洞心。笔电洞宽 ~200px，
+    σ=band/4≈11 的 14 轮扩散只能影响 ~40px —— 洞心永远留一层模糊过的
+    笔电残影（Apple logo 隐约可见），背景板看着像盖了块磨砂玻璃。
+
+    解法是经典 multigrid：一路降采样到最长边 ≤ 64px（此时洞只剩几个
+    像素），在粗尺度上迭代 300 轮**真正解收敛**（开销可忽略），再逐级
+    上采样作初值、每级 24 轮 polish。上采样解已非常接近真解，细尺度
+    只需修局部 —— 每一级的信息都只需要走"本级洞的尺寸"，而不是整幅
+    原图的洞尺寸。确定收敛，无条件留残影。
 
     **不要用"残差不变就早停"**：洞中心在头几轮本来就完全不动（扩散还没
     走到），max|Δ| 一直很小，会立刻误判收敛，然后洞里还是原图的笔电轮廓
     —— 背景板上那条虚线斜边就是这么来的。
     """
-    sigma = max(4.0, band / 4.0)
-    out = rgb.copy()
-    for _ in range(iters):
-        sm = np.stack([ndi.gaussian_filter(out[..., c], sigma) for c in range(3)], -1)
-        out = np.where(src[..., None], rgb, sm)
+    H, W = rgb.shape[:2]
+    n_lv = 0
+    while max(H, W) // (2 ** (n_lv + 1)) > 64:
+        n_lv += 1
+
+    def down_color(a, hs, ws):
+        z = ndi.zoom(a, (hs / a.shape[0], ws / a.shape[1], 1), order=1)
+        return z[:hs, :ws]
+
+    def down_mask(a, hs, ws):
+        z = ndi.zoom(a.astype(np.float32), (hs / a.shape[0], ws / a.shape[1]), order=1)
+        return z[:hs, :ws] > 0.5
+
+    out = None
+    for lv in range(n_lv, -1, -1):
+        f = 2 ** lv
+        hs, ws = max(2, H // f), max(2, W // f)
+        rgb_s = down_color(rgb, hs, ws)
+        src_s = down_mask(src, hs, ws)
+        if out is None:
+            out = rgb_s.copy()
+            n_it = 300            # 最粗级：洞只剩几个像素，多轮必收敛
+        else:
+            out = down_color(out, hs, ws)
+            n_it = iters          # 初值已是近似解，只做 polish
+        sigma = max(2.0, band / f / 4.0)
+        for _ in range(n_it):
+            sm = np.stack([ndi.gaussian_filter(out[..., c], sigma) for c in range(3)], -1)
+            out = np.where(src_s[..., None], rgb_s, sm)
     return np.clip(out, 0, 1)
 
 
@@ -296,12 +329,19 @@ def main():
         subject = np.zeros((H, W), bool)
     else:
         if obj.mean() > 0.004:
-            md = float(np.median(d[obj])) if obj.any() else 1.0
-            # 语义近景（u2netp）里常混着「实体 + 它脚下的桌面/地面」：桌面比
-            # 实体远。只取比语义近景深度中值更近的那团 = 真正的独立物体（笔电）。
-            # 这样 subject 从 20% 收敛到 10%，露出带集中在笔电轮廓外一圈，
-            # 调和插值能收敛成边界墙色，不再把整片桌面前景抹成均值雾。
-            subject = obj & (d < md)
+            # 语义掩码必须**完整**。之前试过用深度中值再切一刀（只取比
+            # d[obj] 中值更近的部分，想滤掉"实体脚下的桌面"），结果深度图
+            # 在反光黑屏上把屏幕估得比机身远 —— 完整的笔电掩码被切成了
+            # C 形，屏幕和右半机身留在了背景板上：fill 把它们当"真实背景"
+            # 原样保留，中心位就浮出一台半透明笔电（Apple logo 清晰可见）。
+            # 深度图对反光/纯色/透明表面本来就不可靠，**不能让它决定掩码的
+            # 完整性**。宁可多抹一点桌面前景 —— 调和插值（multigrid 版）
+            # 对大洞也能收敛成边界材质的延展，虚焦桌面上看不出平滑。
+            lab, n = ndi.label(obj)
+            if n > 1:
+                sizes = ndi.sum(obj, lab, range(1, n + 1))
+                obj = lab == (1 + int(np.argmax(sizes)))
+            subject = ndi.binary_fill_holes(obj)
         else:
             subject = fg
     if subject.mean() < 0.004:
@@ -449,12 +489,23 @@ def main():
                 # 主体内部一律不可信，只留真背景当边界条件。
                 src = ~erase
                 fill = harmonic_fill(rgb, src, band)
-                # 替换边界必须**羽化**。边界是像素级的，遮罩本身带 1px 锯齿，
-                # 就算两侧色差只有 3%，硬切在放大后也是一条断续的虚线
-                # （"边缘一圈毛"的最后一层）。这里羽化半径 ~2px，两侧都是墙，
-                # 过渡完全看不出来。
-                w = np.clip(ndi.gaussian_filter(hole.astype(np.float32), 1.6), 0, 1)
+                # 替换范围必须是**整个主体 + 3px**（erase），不能只是露出带
+                # （hole=ring 外扩 5px 只有一圈）。中心眼位时 subj.png 会盖住
+                # 主体，但它的 alpha 软边处是半透明的 —— bg 上若还留着笔电
+                # 原像素，就会透过软边浮出一层"半透明笔电 + Apple logo 残影"
+                # （正是磨砂玻璃现象的另一半根因：fill 算了整块，写回却只写了
+                # 一圈）。羽化 1.6px 保证替换边界无硬缝。
+                w = np.clip(ndi.gaussian_filter(erase.astype(np.float32), 1.6), 0, 1)
                 bg = rgb * (1 - w[..., None]) + fill * w[..., None]
+                if '--debug' in sys.argv:
+                    Image.fromarray((np.clip(fill, 0, 1) * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_fill.png'))
+                    Image.fromarray((erase * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_erase.png'))
+                    Image.fromarray((obj * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_obj.png'))
+                    Image.fromarray((fg * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_fg.png'))
         bg = np.clip(bg, 0, 1)
         bg = outpaint(lama, bg, pad_x, pad_y, mirror_hf)
 
