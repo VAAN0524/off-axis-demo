@@ -295,7 +295,15 @@ def main():
         print('单层模式：整张照片当一块卡片，无相对位移 = 无露出带 = 无需生成')
         subject = np.zeros((H, W), bool)
     else:
-        subject = obj if obj.mean() > 0.004 else fg
+        if obj.mean() > 0.004:
+            md = float(np.median(d[obj])) if obj.any() else 1.0
+            # 语义近景（u2netp）里常混着「实体 + 它脚下的桌面/地面」：桌面比
+            # 实体远。只取比语义近景深度中值更近的那团 = 真正的独立物体（笔电）。
+            # 这样 subject 从 20% 收敛到 10%，露出带集中在笔电轮廓外一圈，
+            # 调和插值能收敛成边界墙色，不再把整片桌面前景抹成均值雾。
+            subject = obj & (d < md)
+        else:
+            subject = fg
     if subject.mean() < 0.004:
         if not auto_single and not forced_single:
             print('!! 找不到主体，退化成单张卡片')
@@ -324,6 +332,10 @@ def main():
     s_sub, s_bg = shift_px(z_subj), shift_px(z_bg)
     reveal = s_sub - s_bg                     # 主体相对背景多走的像素
     band = int(max(24, reveal * 1.35 + 8))    # 多留 35%，免得补出来的接缝正好卡在露出边界
+    # 真正要抹的只是一圈「轮廓内侧、宽=相对位移」的月牙：主体一移，露出来的
+    # 就是这条。比 band 更窄 → 调和插值扩散半径够覆盖，能收敛成边界墙色梯度；
+    # 不至于把整块主体框成大洞，填出来一片均匀均值（「雾」）。
+    ring_w = int(argval('--ring-w', max(18, round(reveal * 1.25))))
 
     # ── 背景板：只修"轮廓内的一圈"，不修整块主体 ──
     #
@@ -374,7 +386,7 @@ def main():
             sp = band + 6
             erase_pad = np.pad(erase, sp, constant_values=True)
             dist_in = ndi.distance_transform_edt(erase_pad)[sp:-sp, sp:-sp]
-            ring = erase & (dist_in < band)
+            ring = erase & (dist_in < ring_w)
 
             # 替换边界必须**离开轮廓** 5px。
             #
@@ -387,6 +399,14 @@ def main():
             # 但卡片 alpha 在最外 2px 就掉到 0 了，decontaminate 又把 a>0.12
             # 的那段反解回原值 —— 真正裸奔的只有 1~2px，肉眼不可见。
             hole = ndi.binary_dilation(ring, B.disk(5))
+            if '--debug' in sys.argv:
+                sy, sx = np.nonzero(subject)
+                md = float(np.median(d[obj])) if obj.any() else -1
+                print('DIAG subj%%=%.1f obj%%=%.1f fg%%=%.1f obj&fg%%=%.1f obj&near%%=%.1f bbox x[%d,%d] y[%d,%d] dist_max=%.0f ring%%=%.2f hole%%=%.2f'
+                      % (subject.mean() * 100, obj.mean() * 100, fg.mean() * 100,
+                         (obj & fg).mean() * 100, (obj & (d < md)).mean() * 100,
+                         sx.min(), sx.max(), sy.min(), sy.max(),
+                         dist_in.max(), ring.mean() * 100, hole.mean() * 100))
             if ring_mode == 'lama' and lama is not None:
                 # 洞的输入图里，**整个主体 + 它的边界**都要抹平。
                 #
