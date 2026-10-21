@@ -137,7 +137,15 @@ pathlib.Path('models/face_landmarker.b64.js').write_text(
 PY
 ```
 
-追踪初始化分四段，每段独立超时，失败原因会写在面板里：摄像头 12s → 运行时脚本 15s → wasm 20s（本地）/ 50s（CDN）→ 模型 45s。
+追踪初始化分四段，每段独立超时：摄像头 12s → 运行时脚本 15s → 模型 45s（带百分比）→ wasm 下载 30/120s（带百分比）→ 建图 60s。
+
+实测（`--use-fake-device-for-media-stream`）：
+
+| 场景 | 点击到「等待人脸」 | wasm 来源 |
+| --- | --- | --- |
+| 本地 http（首次） | 493 ms | 本地副本 |
+| GitHub Pages（首次） | 6.0 s | Pages 同源，`Content-Encoding: gzip` 压到 2.9 MB |
+| 改之前（直连 CDN） | 28.4 s | jsDelivr，本地档 20 s 超时被打断后被迫换源 |
 
 ## wasm 运行时：为什么必须放进仓库
 
@@ -161,7 +169,33 @@ const MP_WASM_BASES = [
 ];
 ```
 
-`FilesetResolver.forVisionTasks(base)` 只是拼路径 + 探测 SIMD 能力，**不会真下载 wasm**；真正能不能用要等 `createFromOptions`。所以三份 fileset 全部先摆好，挨个建 landmarker，第一个真建起来的才留用 —— 而不是"猜哪个源通"。
+`FilesetResolver.forVisionTasks(base)` 只是拼路径 + 探测 SIMD 能力，**不会真下载 wasm**。实测它返回的就是两个字符串：
+
+```js
+{ wasmLoaderPath: 'wasm/vision_wasm_internal.js',
+  wasmBinaryPath: 'wasm/vision_wasm_internal.wasm' }
+```
+
+所以下载权可以收回自己手里 —— 换成 `blob:` URL 它照样认：
+
+```js
+const paths  = await mp.FilesetResolver.forVisionTasks(base);   // 让它判断 SIMD / nosimd
+const js     = await fetchBytes(paths.wasmLoaderPath, { timeout: 30000 });
+const bin    = await fetchBytes(paths.wasmBinaryPath, { timeout: 120000, onProgress });
+// \0asm 魔数不对就是拿到了 404 页面或半截文件，在这里拦下
+const fileset = {
+  wasmLoaderPath: URL.createObjectURL(new Blob([js],  { type: 'text/javascript' })),
+  wasmBinaryPath: URL.createObjectURL(new Blob([bin], { type: 'application/wasm' })),
+};
+```
+
+这么做换来三件事：
+
+1. **能显示进度**。9.4 MB 在慢网络下要几十秒，不给百分比就是白屏。
+2. **超时不会污染 emscripten**。直接交给它下载时，超时打断能让它的内部状态变坏，之后只会抛 `Aborted`；现在超时只 abort 我们自己的 `fetch`，可以干净地换下一个源重来。
+3. **半截文件当场识别**，不用等它在 `createFromOptions` 里炸出一句看不懂的英文。
+
+还有一处不做会白烧一倍流量：页面加载 350 ms 时会自动起一次追踪，用户点「重启追踪」又是一次完整流程。不缓存的话这 9.4 MB 会**实实在在下载两遍**（`performance.transferSize` 两条都是 9424286）。所以 `filesetFromBlob` 按 base 缓存 blob URL。
 
 目录里只留 SIMD 版：
 

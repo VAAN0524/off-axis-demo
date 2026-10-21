@@ -189,10 +189,19 @@ three r186 的 `GaussianSplat` 有个硬限制：NodeMaterial 来自 `three/webg
 
    两个版本都是 9MB 量级，**换版本救不了**，只能本地化。现在用 0.10.14（9.4MB，比 1.1.1 小 2.6MB），只 vendor SIMD 版，`nosimd` 那 9.3MB 删掉让非 SIMD 浏览器走 CDN。
    9.4MB 的文件在国内从 jsDelivr 拉，几乎必然断在中途 —— 断点处就是那句 `Aborted(both async and sync fetching of the wasm failed)`。这是这句话的真正成因，和模型文件、和 CORS 都无关。
-2. **wasm 三源实测**：不再"猜哪个源通"，而是拿三份 fileset 挨个 `createFromOptions`，第一个真建起来的才留用。
+2. **下载权收回自己手里**：fileset 实测就是 `{ wasmLoaderPath, wasmBinaryPath }` 两个字符串，换成 `blob:` URL 照样认。于是 `fetchBytes` 自己带 `AbortController` 超时、reader 百分比、`\0asm` 魔数校验 ——
+   - 超时中断只 abort 我们自己的 fetch，不会把 emscripten 内部状态搞坏（直接交给它下载时，被打断之后就只会抛 `Aborted`）
+   - 半截文件在开跑前就能识别，不用等它炸一句看不懂的英文
+   - 顺便发现并修掉一处浪费：页面加载 350ms 自动起一次追踪 + 用户点「重启追踪」= 9.4MB 下载两遍（`performance.transferSize` 两条都是 9424286），加 blob 缓存后只剩一次
 3. **错误文案翻译**：emscripten 的原话对用户没有意义，改成「wasm 运行时没下载下来」并区分模型 / wasm / 摄像头三类原因。
 
-实测（`--use-fake-device-for-media-stream`，本地 http）：从点击到「等待人脸」**176ms**，wasm 请求全部落在 `127.0.0.1/wasm/`。
+实测（`--use-fake-device-for-media-stream`）：
+
+| 场景 | 点击到「等待人脸」 |
+| --- | --- |
+| 本地 http | 493 ms |
+| GitHub Pages | 6.0 s（wasm 走 Pages 同源，gzip 到 2.9MB） |
+| 改之前（直连 CDN） | 28.4 s（本地档 20s 超时被打断，被迫换源） |
 
 **还没做**
 
