@@ -137,7 +137,51 @@ pathlib.Path('models/face_landmarker.b64.js').write_text(
 PY
 ```
 
-追踪初始化分四段，每段独立超时，失败原因会写在面板里：摄像头 12s → 运行时 15/25s（jsDelivr → unpkg）→ 模型 45s → GPU 初始化 6s（不过就退 CPU）。
+追踪初始化分四段，每段独立超时，失败原因会写在面板里：摄像头 12s → 运行时脚本 15s → wasm 20s（本地）/ 50s（CDN）→ 模型 45s。
+
+## wasm 运行时：为什么必须放进仓库
+
+`@mediapipe/tasks-vision` 的 npm 包里，`vision_bundle.mjs` 只有 200 KB 量级，真正的算力在 `vision_wasm_internal.wasm` 里 —— 这个文件 **9.4 MB**。
+
+> ⚠️ `curl -w "%{size_download}"` 报的是**压缩后**大小（3.3 MB），别拿它判断体积。用 `node -e 'WebAssembly.compile(fs.readFileSync(f))'` 验证完整性，文件被截断会报 `section (code 11, "Data") extends past end of the module`。
+
+从 CDN 拉这 9.4 MB，在国内几乎必然断在中途，断点处 emscripten 抛的就是：
+
+```
+Aborted(both async and sync fetching of the wasm failed). Build with -sASSERTIONS for more info.
+```
+
+这句话跟模型、跟 CORS 都没关系，**纯粹是 wasm 二进制没下全**。所以 `wasm/` 目录跟着仓库一起走：
+
+```js
+const MP_WASM_BASES = [
+  'wasm',                    // 同源副本，秒开、断网可用
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
+];
+```
+
+`FilesetResolver.forVisionTasks(base)` 只是拼路径 + 探测 SIMD 能力，**不会真下载 wasm**；真正能不能用要等 `createFromOptions`。所以三份 fileset 全部先摆好，挨个建 landmarker，第一个真建起来的才留用 —— 而不是"猜哪个源通"。
+
+目录里只留 SIMD 版：
+
+| 文件 | 大小 | 说明 |
+| --- | --- | --- |
+| `vision_wasm_internal.js` | 210 KB | emscripten glue |
+| `vision_wasm_internal.wasm` | 9.4 MB | 真正的算力 |
+| `vision_wasm_nosimd_internal.js` | 210 KB | 非 SIMD 浏览器的 glue（wasm 走 CDN 兜底） |
+
+非 SIMD 浏览器的 9.3 MB `vision_wasm_nosimd_internal.wasm` 没有入库：现代浏览器（Chrome 91+ / Safari 16.4+ / Firefox 89+）都支持 SIMD，真遇上老浏览器会 404，然后自动落到 CDN 那一档。
+
+删掉 nosimd wasm 之前确认过 SIMD 版能独立编译：
+
+```bash
+node -e 'const fs=require("fs"); WebAssembly.compile(fs.readFileSync("wasm/vision_wasm_internal.wasm"))
+  .then(()=>console.log("OK")).catch(e=>console.log("FAIL",e.message))'
+```
+
+顺带一个反直觉的结论：**换版本救不了这个体积**。1.1.1 的 wasm 约 12 MB，0.10.14 是 9.4 MB，都是 9 MB 量级。
+
 
 ## 已知的坑
 
@@ -150,6 +194,9 @@ PY
 - **遮罩别开 mipmap，三角面要双面**：剪影处 UV 变化极快，粗 mip 里的遮罩边缘是台阶，屏幕上就是"被啃掉一块"；坡道上的三角面还会翻面，`FrontSide` 会被背面剔除啃出锯齿。
 - **裙边别压暗**：靠压暗藏边缘会在"近景裙边"和"背景板"之间露出一道亮度缝，比拉丝本身更显眼。
 - **鼠标映射别给太大**：`±14 cm` 足够看出视差；映射到半屏时眼位会跑到屏幕边缘，单目深度根本补不出那块被挡住的像素。
+- **`Aborted(both async and sync fetching of the wasm failed)` 不是模型问题**：是 9.4 MB 的 wasm 没下全，见上面「wasm 运行时」一节。同理，`-sASSERTIONS` 只会让错误更啰嗦，不会让它能跑。
+- **同一页只能有一份 MediaPipe runtime**：同时引入 legacy `@mediapipe/pose` 和新版 `tasks-vision` 会撞出两个 emscripten 实例，症状同样是各种 `Aborted`（官方 issue #5495）。
+- **GPU delegate 会静默卡死**：`baseOptions.delegate: 'GPU'` 在部分驱动上既不返回也不报错。检测本身是每 45 ms 一次，CPU 在 M 系列上 6–8 ms/帧完全够，所以只用 CPU。
 
 ## 素材
 
@@ -157,6 +204,8 @@ PY
 - 深度模型：`onnx-community/depth-anything-v2-small` 的 `model_quantized.onnx`（约 27 MB，仅离线用，不进仓库）。
 - 3DGS 样本：three.js 官方示例 `examples/models/spz/lion.v3.spz`（195k splats，4.1MB）。
 - 人脸模型：MediaPipe `face_landmarker` float16。
+- wasm 运行时：`@mediapipe/tasks-vision@0.10.14` 的 `wasm/`（Apache-2.0），只留 SIMD 版。
+- 开源参考与踩坑对照：见 `REFERENCES.md`。
 
 ## 授权
 

@@ -63,7 +63,37 @@ projectionMatrix.makePerspective(left, right, top, bottom, near, far);
 
 艺术装置式实现，代码量小、可读性高。不含 3DGS，纯 head-coupled perspective，适合当最小可运行骨架读。TensorFlow.js 版人脸关键点比 MediaPipe 慢，但依赖更少。
 
-### 5. 其它小体量实现（想吃透数学时读）
+### 5. umshere/headtrack-3d-window
+
+- https://github.com/umshere/headtrack-3d-window
+- Apache-2.0 / 原生 ES Module，无构建步骤
+
+它的取舍很明确：**放弃自动测屏幕，直接让用户填物理尺寸。**
+
+```js
+const DEFAULT_IPD = 0.063;     // 63mm
+const SCREEN_WIDTH_M = 0.28;   // 用户自己量
+```
+
+README 里直接写「For better realism: measure your actual screen width」。我们走的是"对角线 + 视口宽高比推算"，开箱即用但误差会进 z 的估计；它那条路更准但要求用户动手。两条路的差别值得保留成 A/B 选项。
+
+### 6. MindDock/off-axis-demo（本项目的前身）
+
+- https://github.com/MindDock/off-axis-demo
+- 34★ / MIT / Three.js + MediaPipe FaceMesh
+
+它的实现比想象中朴素：
+
+```js
+const SCREEN_WIDTH_CM = 30.0;
+const SCREEN_HEIGHT_CM = 20.0;
+const BOX_DEPTH_CM = 80.0;
+const SENSITIVITY = 2.5;   // 头部位置直接乘一个系数
+```
+
+取虹膜 468/473，位置**乘灵敏度**后直接喂给离轴矩阵，z 用固定距离 + `LERP` 平滑。也就是说它没有针孔模型、没有瞳距反解深度 —— 我们现在的 z 是由 `z = z_ref × ipd_ref / ipd` 反解出来的，前后移动是真的会动，它那套只是"左右晃得像"。这也是它看起来"像看一个盒子"、我们看起来"像一扇窗"的原因。
+
+### 7. 其它小体量实现（想吃透数学时读）
 
 | 仓库 | 说明 |
 | --- | --- |
@@ -71,7 +101,6 @@ projectionMatrix.makePerspective(left, right, top, bottom, near, far);
 | https://github.com/fenollp/uniVR | 纯 GLSL + 单摄像头，软件实现的 head-coupled perspective |
 | https://github.com/jsimonson2013/aframe-head-tracker-controls-component | A-Frame 组件形态，接口设计可参考 |
 | https://github.com/sangil1018/off-axis-projection | React Three Fiber + MediaPipe，含校准向导与麦克风电平驱动的抖动 |
-| https://github.com/MindDock/off-axis-demo | 34★ 本项目的前身：GLTF 模型 + 赛博朋克网格 + 控制面板 |
 
 ## 二、3DGS 渲染器（当前用 three 内置，可替换）
 
@@ -95,8 +124,78 @@ three r186 的 `GaussianSplat` 有个硬限制：NodeMaterial 来自 `three/webg
 | https://github.com/jeeliz/jeelizFaceFilter | 老牌 WebGL 人脸追踪，模型小、启动快，适合低端机 |
 | https://github.com/brownhci/WebGazer | 纯眼动（不动头）方案。与本项目互补：头动给视差，眼动给交互焦点 |
 
-## 四、三条可以立刻落地的改进
+## 四、单图深度视差（我们现在的深度网格方案，同行是怎么做的）
 
-1. **vendor MediaPipe 运行时**（抄 Cam2Hologram）：把 `vision_bundle.mjs` 与 `wasm/` 放进 `vendor/`，CDN 只作兜底。这样「断网也能跑」才成立——现在只本地化了模型。
-2. **3DGS 换 Spark**：`GaussianSplat` 在无 WebGPU 的机器上完全不可用，Spark 覆盖 WebGL2，并且原生支持多视角，与离轴的思路更契合。
-3. **加物理校准向导**（抄 off-axis-sneaker）：让用户输入屏幕对角线、观看距离、眼睛高度，存 `localStorage`。目前屏幕尺寸靠对角线滑杆 + 视口比例推算，精度够用但不够「开箱即准」。
+### 1. Tiefling
+
+- MIT，纯浏览器，`DepthAnythingV2`（ONNX）+ three.js，复刻 Facebook 3D Photo
+- 关键一句（README）：*"expands the depth map at edges to reduce stretching artifacts"*
+
+**和我们踩的坑完全一样，解法也一样**：深度图边缘不往外补，物体挪开就会露出拉伸的边。我们是 push-pull 外扩 + 底版补洞，它是把深度图本身往外扩。区别是它把深度推理放在浏览器里跑（快机器也要 ~20s），我们是离线烘焙（0.5s/张，产物 90KB）。**结论：这条路上"离线烘焙 + 运行时只读图"是对的。**
+
+### 2. murtilli/parallax-maker
+
+- Python + Dash，做 2.5D 动画卡片，可导出 glTF
+- 核心做法：**用 SAM（Segment Anything）做实例分割来切卡片，而不是用深度阈值**
+
+这是比我们更稳的一步。我们用「深度阈值 + 导向滤波」切笔电和桌面，边界依赖深度图精度；它用语义分割，边界直接贴在物体轮廓上。代价是要跑 SAM（重），收益是**"桌上笔电 vs 后面白墙"这种语义边界不会切错**。它还带 inpainting（把遮罩区域补成背景），和我们的 `near_plate.jpg` 同一件事。
+
+### 3. metrovoc/spatial-scene
+
+- FastAPI + PyTorch + React Three Fiber
+- 流程：深度估计 → inpainting 补洞 → 分层渲染（自称 LDI，Layered Depth Image）
+
+**和我们的「满幅背景底版 + 剪影近景」是同构的**，只是它把 inpainting 放在服务端。可以作为"这套结构是业界标准解"的旁证。
+
+### 4. SLIDE: Single Image 3D Photography（ICCV 2021）
+
+- 论文 + 社区复现（`macvincent/Single-Image-3D-Photography`）
+- 提出 **soft layering**：层与层之间是软的 alpha 过渡，而不是硬切
+
+正好命中我们的短板。现在前景是硬 alpha，遇到头发、树叶、纱窗这种"半透明薄结构"会切出一圈硬边。soft layering 是这类问题的正统解法，但需要额外的 matting 模型，暂时不做。
+
+### 5. activeguild/render-image-depth
+
+- Next.js + transformers.js，浏览器内跑 Depth Anything，按深度切 **2–20 层**透明平面
+
+值得注意：它证明**层数多到一定程度，"每层整块平移"也能看起来顺滑**。反过来说，我们旧的「三层贴片」之所以像贴纸，不是层数少，而是**每层内部深度恒定、整块刚性平移**。这个对照能解释为什么深度网格（逐顶点 z）是质变而不是量变。
+
+## 五、追踪的两种非主流路线（值得知道）
+
+| 项目 | 做法 | 什么时候该用 |
+| --- | --- | --- |
+| https://github.com/quasarbright/head-tracking-window | 手机贴眼镜当追踪器，看屏幕上的 ArUco 标记，`solvePnP` 解位姿，WebRTC 传回 PC | 精度要求高、或摄像头不能正对脸。比单目人脸关键点准一个量级 |
+| https://github.com/selop/pokebox | 桌面用 MediaPipe，**移动端改用陀螺仪**，键盘/鼠标兜底 | 手机上摄像头追踪又费电又不稳，陀螺仪给"倾斜视差"更划算 |
+
+两者都印证了同一件事：**摄像头追踪一定要有降级路径**，不能只留"失败"这一种状态。
+
+## 六、MediaPipe 运行时的加载，社区结论
+
+- `google-ai-edge/mediapipe#4827`：官方维护者明确说 *"You can also use a custom location for the WASM files by passing it to `FilesetResolver.forVisionTasks('http:/...')`"*
+- `#5495`：**同时加载 legacy `@mediapipe/pose` 和 `@mediapipe/tasks-vision` 会撞出两个 emscripten runtime**，症状就是各种 `Aborted` —— 一个页面只能有一份
+- 通行做法（Cam2Hologram、parallax 类项目）：把 `vision_bundle.mjs` + `wasm/` 一起 vendored 进仓库，CDN 只作兜底
+
+## 七、已经落地 / 还没做
+
+**已落地**
+
+1. **vendor MediaPipe 运行时**：`wasm/` 放仓库里，`FilesetResolver.forVisionTasks('wasm')` 优先，CDN 两源兜底。
+   实测数据（别再被 curl 的 `size_download` 骗了，那是**压缩后**大小）：
+
+   | 版本 | curl 报的大小 | 实际 `vision_wasm_internal.wasm` |
+   | --- | --- | --- |
+   | 1.1.1 | 3.7MB | **≈12MB** |
+   | 0.10.14 | 3.3MB | **9.4MB** |
+
+   两个版本都是 9MB 量级，**换版本救不了**，只能本地化。现在用 0.10.14（9.4MB，比 1.1.1 小 2.6MB），只 vendor SIMD 版，`nosimd` 那 9.3MB 删掉让非 SIMD 浏览器走 CDN。
+   9.4MB 的文件在国内从 jsDelivr 拉，几乎必然断在中途 —— 断点处就是那句 `Aborted(both async and sync fetching of the wasm failed)`。这是这句话的真正成因，和模型文件、和 CORS 都无关。
+2. **wasm 三源实测**：不再"猜哪个源通"，而是拿三份 fileset 挨个 `createFromOptions`，第一个真建起来的才留用。
+3. **错误文案翻译**：emscripten 的原话对用户没有意义，改成「wasm 运行时没下载下来」并区分模型 / wasm / 摄像头三类原因。
+
+实测（`--use-fake-device-for-media-stream`，本地 http）：从点击到「等待人脸」**176ms**，wasm 请求全部落在 `127.0.0.1/wasm/`。
+
+**还没做**
+
+4. **3DGS 换 Spark**：`GaussianSplat` 在无 WebGPU 的机器上完全不可用；Spark 覆盖 WebGL2，且原生支持多视角，与离轴更搭。
+5. **物理校准向导**（抄 off-axis-sneaker / pokebox）：让用户填屏幕对角线、观看距离、眼高并存 `localStorage`，现在靠滑杆推算是"够用但不准"。
+6. **换 SAM 切层**（抄 parallax-maker）：把深度阈值换成语义分割，专治"笔电 vs 白墙"这类边界。

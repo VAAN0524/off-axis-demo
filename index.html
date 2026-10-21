@@ -994,12 +994,27 @@ let lastDetectAt = 0;
 let detectInterval = 45; // ms，按单帧推理实际耗时自适应
 let starting = false;
 
-const MP_VERSION = '1.1.1';
+/**
+ * 版本 0.10.14：vision_wasm_internal.wasm 实际有 9.4MB（curl 报的 3.3MB 是
+ * 压缩后大小，别被骗）。1.1.1 更大，约 12MB。国内从 CDN 拉这种体量几乎必
+ * 断在半路，断点处 emscripten 就抛
+ * 「Aborted(both async and sync fetching of the wasm failed)」。
+ * 所以 wasm 必须同源自带，版本本身救不了。换版本时 wasm/ 里四个文件一起换。
+ */
+const MP_VERSION = '0.10.14';
 const MP_BUNDLES = [
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
   `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
 ];
-const MP_WASM = [
+/**
+ * wasm 基址按顺序实测，第一个能真正把 landmarker 建起来的才算数。
+ * 顺序很重要：`wasm` 是仓库里自带的副本（9.4MB，同源、秒开、断网也能用）。
+ * 走 CDN 时这个体积在国内经常只跑到一半就断，浏览器报的
+ * "Aborted(both async and sync fetching of the wasm failed)" 就是它。
+ * —— 注意 wasm 必须和 MP_VERSION 同版本，升级时两边一起换。
+ */
+const MP_WASM_BASES = [
+  'wasm',
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
   `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
 ];
@@ -1080,22 +1095,47 @@ async function openCamera() {
   document.getElementById('camwrap').classList.remove('hidden');
 }
 
-/** ② MediaPipe 运行时（jsDelivr 为主，unpkg 备份） */
+/**
+ * emscripten 抛的原始文案对用户毫无意义，翻成人话。
+ * "both async and sync fetching of the wasm failed" = wasm 二进制没拿到
+ * （404 / 网络中断 / file:// 的 CORS），和模型文件无关。
+ */
+function wasmErrorText(e) {
+  const m = (e?.message || String(e)).toLowerCase();
+  if (m.includes('wasm') && (m.includes('async') || m.includes('abort') || m.includes('fetch'))) {
+    return 'wasm 运行时没下载下来（9.4MB 的 vision_wasm_internal.wasm）';
+  }
+  if (m.includes('abort')) return 'wasm 运行时启动失败';
+  return e?.message || String(e);
+}
+
+/** ② MediaPipe 运行时：bundle 两源，wasm 三源，全部先摆好，实测哪个能起来 */
 async function loadRuntime() {
-  let lastErr;
-  for (let i = 0; i < MP_BUNDLES.length; i++) {
+  let mp = null;
+  const errs = [];
+  for (const url of MP_BUNDLES) {
     try {
-      const mp = await withTimeout(import(/* @vite-ignore */ MP_BUNDLES[i]), 15000, '运行时脚本下载超时');
-      const fileset = await withTimeout(
-        mp.FilesetResolver.forVisionTasks(MP_WASM[i] || MP_WASM[0]),
-        25000, 'wasm 下载超时',
-      );
-      return { mp, fileset };
+      mp = await withTimeout(import(/* @vite-ignore */ url), 15000, '运行时脚本下载超时');
+      break;
     } catch (e) {
-      lastErr = e;
+      errs.push(wasmErrorText(e));
     }
   }
-  throw new Error('MediaPipe 运行时加载失败（网络不通）：' + (lastErr?.message || ''));
+  if (!mp) throw new Error('MediaPipe 运行时脚本加载失败：' + errs.join('；'));
+
+  // forVisionTasks 只是拼路径 + 探测 SIMD 能力，不会真下载 wasm；
+  // 真正能不能用要等 createFromOptions，所以这里把候选全交出去挨个试。
+  const filesets = [];
+  for (const base of MP_WASM_BASES) {
+    if (base === 'wasm' && isFileProtocol()) continue; // file:// 下同源也读不到
+    try {
+      filesets.push({ base, fileset: await mp.FilesetResolver.forVisionTasks(base) });
+    } catch (e) {
+      errs.push(`${base}：${wasmErrorText(e)}`);
+    }
+  }
+  if (!filesets.length) throw new Error('MediaPipe wasm 路径都不可用：' + errs.join('；'));
+  return { mp, filesets };
 }
 
 /** base64 → Uint8Array（分块解码，5MB 也不会卡主线程太久） */
@@ -1201,19 +1241,36 @@ async function fetchModelBuffer() {
   throw new Error(`人脸模型读取失败（${fails.join('；')}）。${hint}`);
 }
 
-/** ④ 建 landmarker：GPU 不行自动退 CPU */
-async function createLandmarker(mp, fileset, buffer) {
-  const opts = (delegate) => ({
-    baseOptions: { modelAssetBuffer: buffer, delegate },
+/**
+ * ④ 建 landmarker：挨个 wasm 基址实测，第一个建起来的就留用。
+ * 只用 CPU delegate —— GPU delegate 在部分驱动上会**静默卡死**（不报错、不返回），
+ * 而检测本身是每 45ms 一次，CPU 在 M 系列上 6~8ms/帧完全够。
+ */
+async function createLandmarker(mp, filesets, buffer, onTry) {
+  const opts = {
+    baseOptions: { modelAssetBuffer: buffer, delegate: 'CPU' },
     runningMode: 'VIDEO',
     numFaces: 1,
-  });
-  try {
-    // GPU delegate 在部分环境会静默卡住，6 秒没起来就换 CPU，别让整条链路干等
-    return await withTimeout(mp.FaceLandmarker.createFromOptions(fileset, opts('GPU')), 6000, 'GPU 初始化超时');
-  } catch {
-    return await mp.FaceLandmarker.createFromOptions(fileset, opts('CPU'));
+  };
+  const errs = [];
+  for (const { base, fileset } of filesets) {
+    const local = base === 'wasm';
+    onTry?.(local ? '加载本地 wasm…' : '下载 wasm 9.4MB…');
+    try {
+      // 本地副本秒开；走 CDN 要下 9.4MB，给足预算，别让它半路被超时砍掉
+      const lm = await withTimeout(
+        mp.FaceLandmarker.createFromOptions(fileset, opts),
+        local ? 20000 : 50000,
+        'wasm 初始化超时',
+      );
+      return { lm, base };
+    } catch (e) {
+      errs.push(`${local ? '本地 wasm' : 'CDN wasm'}：${wasmErrorText(e)}`);
+      console.warn('[track] wasm 源失败', base, e?.message || e);
+    }
   }
+  throw new Error('wasm 运行时加载失败（' + errs.join('；') + '）'
+    + (isFileProtocol() ? '。当前是 file:// 打开，浏览器不允许读同目录的 wasm，请改用 http(s) 或线上地址。' : ''));
 }
 
 /** 启动 / 重启追踪：分阶段报状态，任何一步失败都说清原因 */
@@ -1230,14 +1287,14 @@ async function startTracking() {
 
     setTrackDetail('摄像头已就绪，加载 MediaPipe 运行时…');
     setTrack('加载运行时…');
-    const { mp, fileset } = await loadRuntime();
+    const { mp, filesets } = await loadRuntime();
 
     setTrackDetail('运行时已就绪，读取人脸模型…');
     setTrack('下载模型…');
     const buffer = await fetchModelBuffer();
 
-    setTrack('初始化模型…');
-    landmarker = await createLandmarker(mp, fileset, buffer);
+    const { lm } = await createLandmarker(mp, filesets, buffer, (t) => setTrack(t));
+    landmarker = lm;
 
     state.tracking = true;
     state.live = false;
@@ -1252,14 +1309,22 @@ async function startTracking() {
     const msg = err?.message || String(err);
     const framed = (() => { try { return window.self !== window.top; } catch { return true; } })();
     const modelIssue = /模型/.test(msg);
+    const wasmIssue = /wasm/i.test(msg);
     setTrack('未启用', 'bad');
-    setTrackDetail(msg + (modelIssue ? '' : '（点上面的按钮重试；也可以先用鼠标模拟头部）'), true);
+    setTrackDetail(
+      msg + (modelIssue || wasmIssue
+        ? '（点上面的按钮重试；也可以先用鼠标模拟头部）'
+        : ''),
+      true,
+    );
     // 被嵌在预览框里时，摄像头权限多半被 iframe 策略拦掉 → 引导去新窗口
     document.getElementById('btnOpen').classList.toggle('show', framed);
-    // 模型读不到时，给一个直接选文件的入口（file:// 下唯一能自洽救回来的办法）
+    // 只有"模型读不到"才给选文件的入口；wasm 挂了选模型没用
     document.getElementById('btnPickModel').classList.toggle('show', modelIssue);
     if (btn) { btn.disabled = false; btn.textContent = '重试追踪'; btn.classList.remove('on'); }
-    toast(modelIssue ? '人脸模型没读到，可点面板里的「选择模型文件」手动载入' : msg);
+    toast(wasmIssue
+      ? 'wasm 运行时没加载成功，点「重试追踪」再来一次'
+      : modelIssue ? '人脸模型没读到，可点面板里的「选择模型文件」手动载入' : msg);
     // 摄像头通了但模型挂了：保留预览，让人知道摄像头本身是好的
     if (!camStream) document.getElementById('camwrap').classList.add('hidden');
   } finally {
