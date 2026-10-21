@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>卡片栈离轴视差 · 原型</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; overflow: hidden; }
+  body { font: 13px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; color: #e8ecf2; }
+  #stage { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+  .hud {
+    position: fixed; left: 16px; top: 14px; padding: 10px 12px;
+    background: rgba(16,19,24,.72); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; backdrop-filter: blur(12px); font-variant-numeric: tabular-nums;
+    pointer-events: none; transition: opacity .2s;
+  }
+  .hud b { font-weight: 600; letter-spacing: .02em; }
+  .hud .row { display: flex; gap: 10px; color: #9aa4b2; font-size: 12px; }
+  .hud .row span { color: #e8ecf2; }
+
+  .bar {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 14px; padding: 9px 14px;
+    background: rgba(16,19,24,.72); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 999px; backdrop-filter: blur(12px); font-size: 12px; color: #9aa4b2;
+  }
+  input[type=range] { -webkit-appearance: none; width: 190px; height: 3px; border-radius: 2px;
+    background: rgba(255,255,255,.16); outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px;
+    border-radius: 50%; background: #e8ecf2; cursor: pointer; }
+  button { font: inherit; color: #dfe5ee; background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 999px; padding: 4px 11px; cursor: pointer; }
+  button[aria-pressed=true] { background: #e8ecf2; color: #14171c; border-color: transparent; }
+  .err { position: fixed; inset: 0; display: grid; place-items: center; text-align: center;
+    color: #ff9b9b; font-size: 14px; padding: 30px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+
+<div class="hud">
+  <div><b>卡片栈</b> · <span id="mode">—</span></div>
+  <div class="row"><span id="eyelab">眼位 0.0 / 0.0 cm</span><span id="fpslab">— fps</span></div>
+  <div class="row"><span id="padlab">—</span></div>
+</div>
+
+<div class="bar">
+  <label>眼位</label>
+  <input id="eye" type="range" min="-100" max="100" value="0">
+  <button id="swing" aria-pressed="false">自动摆动</button>
+  <button id="zero">回中</button>
+</div>
+
+<script>
+/* ─────────────────────────────────────────────────────────────────────
+ * 卡片栈渲染：每层是**一块刚体平面**，整层只做平移，层内不采样深度。
+ *
+ * 为什么要这样：一块正对镜头的平面，在针孔相机下眼睛横移 E 时，
+ * 屏幕位移严格等于
+ *
+ *     shift = E · k · zRef / (zRef + z)          （k = 每米多少像素）
+ *
+ * 全层同一个 z，所以全层同一个位移 —— 纯平移，没有任何形变。
+ * 这就是"层内零扭曲"的来源，不是近似省事，是这块平面本来就没有变形。
+ *
+ * 而 LDI 网格给每个顶点各自一个 z（把逐像素深度搬进几何），
+ * 相邻顶点位移不同 → 三角形被剪切；轮廓两侧顶点 z 差一大截 →
+ * 那个三角形被拉成橡皮布，颜色跨轮廓互相渗透。扭曲和锯齿都是这么来的。
+ * ───────────────────────────────────────────────────────────────────── */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha: false });
+
+const params = new URLSearchParams(location.search);
+const DIR = params.get('cards') || 'cards/near';
+const HALF_W_M = 0.35;      // 屏幕半宽（米），与烘焙脚本对齐
+const EYE_MAX = 0.075;      // 眼位横移上限
+const Z_REF = 0.60;         // 参考眼距
+
+const S = { meta: null, layers: [], eye: { x: 0, y: 0 }, target: { x: 0, y: 0 },
+            swing: false, t: 0, w: 0, h: 0, dpr: 1 };
+window.__cards = S;          // 便于外部脚本推到指定眼位截图
+const img = {};
+let edgeColor = '#101318';
+
+function load(url) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => rej(new Error(url));
+    im.src = url + (url.includes('?') ? '&' : '?') + 'v=' + Date.now();
+  });
+}
+
+async function boot() {
+  let meta;
+  try {
+    const r = await fetch(DIR + '/meta.json?t=' + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    meta = await r.json();
+  } catch (e) {
+    document.body.innerHTML = '<div class="err">读不到 ' + DIR + '/meta.json<br>'
+      + '先用 tools/make_cards.py 烘焙一套卡片</div>';
+    return;
+  }
+  S.meta = meta;
+  const files = [...new Set(meta.layers.map(l => l.file))];
+  await Promise.all(files.map(async f => { img[f] = await load(DIR + '/' + f); }));
+
+  S.layers = meta.layers.slice().sort((a, b) => a.order - b.order);
+  document.getElementById('mode').textContent =
+    S.layers.length + ' 层 · ' + meta.image.w + '×' + meta.image.h;
+  const qa = meta.qa || {};
+  document.getElementById('padlab').textContent =
+    '露出 ' + Math.round(qa.reveal_px || 0) + 'px / 外扩 ' + (qa.pad_px || 0) + 'px'
+    + (qa.pad_ok === false ? ' · 不足' : ' · 够');
+
+  // 采样背景板边色兜底，万一视图比例极端也不会露白
+  try {
+    const c = document.createElement('canvas'); c.width = c.height = 1;
+    c.getContext('2d').drawImage(img[S.layers[0].file], 4, 4, 8, 8, 0, 0, 1, 1);
+    const p = c.getContext('2d').getImageData(0, 0, 1, 1).data;
+    edgeColor = `rgb(${p[0]},${p[1]},${p[2]})`;
+  } catch (e) { /* 跨域时忽略 */ }
+
+  resize();
+  addEventListener('resize', resize);
+  bindInput();
+  requestAnimationFrame(loop);
+}
+
+function resize() {
+  S.dpr = Math.min(devicePixelRatio || 1, 2);
+  S.w = innerWidth; S.h = innerHeight;
+  cv.width = Math.round(S.w * S.dpr);
+  cv.height = Math.round(S.h * S.dpr);
+}
+
+/* 照片矩形：cover 铺满视口，居中。所有层的 rect 都相对这张照片的左上角。 */
+function frame() {
+  const { w: W, h: H } = S.meta.image;
+  const s = Math.max(S.w / W, S.h / H);
+  return { s, ox: (S.w - W * s) / 2, oy: (S.h - H * s) / 2 };
+}
+
+function draw() {
+  const { s, ox, oy } = frame();
+  const k = S.w / (2 * HALF_W_M);          // 每米像素（按屏幕宽度算）
+  ctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
+  ctx.fillStyle = edgeColor;
+  ctx.fillRect(0, 0, S.w, S.h);
+
+  for (const L of S.layers) {
+    const par = Z_REF / (Z_REF + L.z);     // 视差系数：0=像贴在屏幕，1=极近
+    const dx = -S.eye.x * k * par;
+    const dy = -S.eye.y * k * par;
+    const [rx, ry, rw, rh] = L.rect;
+    ctx.drawImage(img[L.file],
+      ox + rx * s + dx, oy + ry * s + dy, rw * s, rh * s);
+  }
+}
+
+let last = performance.now(), ema = 16;
+function loop(now) {
+  const dt = Math.min(64, now - last); last = now;
+  ema = ema * 0.9 + dt * 0.1;
+  S.t += dt / 1000;
+  if (S.swing) {
+    S.target.x = Math.sin(S.t * 0.9) * EYE_MAX;
+    S.target.y = Math.sin(S.t * 0.62 + 1.1) * EYE_MAX * 0.45;
+  }
+  const a = 1 - Math.pow(0.0015, dt / 1000);   // 与帧率无关的指数平滑
+  S.eye.x += (S.target.x - S.eye.x) * a;
+  S.eye.y += (S.target.y - S.eye.y) * a;
+  draw();
+  document.getElementById('eyelab').textContent =
+    `眼位 ${(S.eye.x * 100).toFixed(1)} / ${(S.eye.y * 100).toFixed(1)} cm`;
+  document.getElementById('fpslab').textContent = Math.round(1000 / ema) + ' fps';
+  requestAnimationFrame(loop);
+}
+
+function bindInput() {
+  const setFrom = (cx, cy) => {
+    S.target.x = (cx / S.w - 0.5) * 2 * EYE_MAX;
+    S.target.y = -(cy / S.h - 0.5) * 2 * EYE_MAX * 0.6;
+    S.swing = false;
+    document.getElementById('swing').setAttribute('aria-pressed', 'false');
+    document.getElementById('eye').value = Math.round(S.target.x / EYE_MAX * 100);
+  };
+  addEventListener('pointermove', e => setFrom(e.clientX, e.clientY));
+  addEventListener('touchmove', e => {
+    if (e.touches[0]) setFrom(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: true });
+  document.getElementById('eye').addEventListener('input', e => {
+    S.target.x = e.target.value / 100 * EYE_MAX; S.swing = false;
+    document.getElementById('swing').setAttribute('aria-pressed', 'false');
+  });
+  document.getElementById('swing').addEventListener('click', e => {
+    S.swing = !S.swing;
+    e.currentTarget.setAttribute('aria-pressed', String(S.swing));
+  });
+  document.getElementById('zero').addEventListener('click', () => {
+    S.target.x = S.target.y = 0; S.swing = false;
+    document.getElementById('swing').setAttribute('aria-pressed', 'false');
+    document.getElementById('eye').value = 0;
+  });
+  addEventListener('keydown', e => {
+    const step = e.shiftKey ? EYE_MAX : EYE_MAX * 0.35;
+    if (e.key === 'ArrowLeft') S.target.x -= step;
+    else if (e.key === 'ArrowRight') S.target.x += step;
+    else if (e.key === 'ArrowUp') S.target.y += step * 0.6;
+    else if (e.key === 'ArrowDown') S.target.y -= step * 0.6;
+    else return;
+    S.target.x = Math.max(-EYE_MAX, Math.min(EYE_MAX, S.target.x));
+    S.swing = false;
+    document.getElementById('swing').setAttribute('aria-pressed', 'false');
+  });
+}
+
+boot();
+</script>
+</body>
+</html>

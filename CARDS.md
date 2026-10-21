@@ -1,0 +1,302 @@
+# 卡片栈：用「刚体平面」代替「逐像素形变」
+
+> 这一版换掉了 LDI 网格。原因不是参数没调好，是**网格这条路本身会制造扭曲**。
+> 下面先讲清楚为什么，再讲资产怎么造、提示词怎么写、以及「图片 + 3D 模型贴图」
+> 那条路值不值得走。
+
+---
+
+## 一、三个毛病，其实是同一个原因
+
+用户看到的三类问题，追到根上是同一件事：**把逐像素深度搬进了几何**。
+
+| 现象 | 直接原因 | 机制 |
+| --- | --- | --- |
+| 主体轮廓一圈锯齿 | 网格顶点密度不够 + 轮廓两侧深度突变 | 剪影两侧相邻顶点位移差几十像素，中间那个三角形被拉成橡皮布，颜色跨轮廓互相渗透 |
+| 主体内部「扭曲 / 液化」 | 同一块面内深度有微差 | 每个顶点按自己的 z 缩放，面被剪切，物体像被拧了一下 |
+| 背景超出原图后出现白斑 / 硬边 | 画面边缘没有内容 | 网格只覆盖原图，眼睛一移就露底，只能靠插值补，补出来就是一块纯色 |
+
+网格的**本意**是对的：让每个像素按自己的深度移动。但单目深度在物体轮廓、
+细杆、桌沿这些地方会糊十几像素，而**几何对深度误差是放大传达的**——
+深度错 10 像素，几何就撕 10 像素，任何后处理都救不回来。
+
+## 二、卡片栈：把「面片」当刚体
+
+一块**正对镜头**的平面，在针孔相机下眼睛横移 E 时，屏幕位移严格等于
+
+```
+shift(px) = E · k · zRef / (zRef + z)        k = 屏幕宽 / 2·halfW（每米像素）
+```
+
+全层只有一个 z，所以全层只有一个位移：**纯平移，零形变**。这不是近似省事，
+而是这块平面本来就没有变形。层与层之间的遮挡关系由绘制顺序 + 真实 alpha 决定。
+
+于是三个毛病按构造消失：
+
+- 层内不采样深度 → 不可能有剪切/扭曲；
+- 轮廓是真 alpha 遮罩整体平移 → 边缘就是原照片的边缘，锯齿无从产生；
+- 背景板四周先生成式外扩 → 怎么移都有内容兜底，白斑不可能出现。
+
+`index.html` 用的是逐顶点网格，`cards.html` 用的是刚体平面，两套并存便于对比。
+
+### 位移预算：立体感 = 露出带宽度
+
+层与层的**相对**位移，就是主角剪影旁边会空出来、必须凭空造出来的那条带子的宽度：
+
+```
+reveal(px) = EYE_MAX · (W/2·halfW) · zRef · ( 1/(zRef+z_subj) − 1/(zRef+z_bg) )
+```
+
+以 EYE_MAX=0.075m、zRef=0.6m 代入，**用「占画面宽度的百分比」表示**
+（像素值随分辨率变，百分比不变；1280 宽时 1% = 12.8px）：
+
+| z 主体 | z 背景 | 相对位移（= 立体感 = 要造的面积） | 1280 宽屏幕上 |
+| --- | --- | --- | --- |
+| 0.25 m | 1.6 m | 4.6 % | 59 px |
+| **0.35 m** | **1.6 m** | **3.8 %**（当前默认） | **49 px** |
+| 0.45 m | 1.6 m | 3.2 % | 41 px |
+| 0.35 m | 2.2 m | 4.5 % | 57 px |
+| 0.50 m | 1.2 m | 2.3 % | 29 px |
+
+**这张表是全部取舍的核心**：你想要的「立体感」和「必须凭空生成的内容面积」
+是同一个数，不可能只要前者不要后者。所以只有两条路——把带子做小（牺牲立体感），
+或者把带子补好（生成式）。本文档后面都在讲后者。
+
+---
+
+## 三、四条路线，选哪条
+
+| 路线 | 层内扭曲 | 剪影锯齿 | 边缘露白 | 需要生成的内容 | 成本 |
+| --- | --- | --- | --- | --- | --- |
+| LDI 逐像素网格 | 有 | 有 | 有 | 整圈 | 低（已实现，有问题） |
+| **卡片栈（本方案）** | **无** | **无** | **无**（外扩兜底） | **仅剪影内 37px 一圈** | 低 |
+| 生成式多视角交叉淡化 | 无 | 无 | 无 | 整张图 ×2~3 | 高，且易出现「逐渐变形」的梦感 |
+| 单图生 3D + 贴图 | 无 | 无（真几何） | 无 | 背面/侧面 | 很高，只适合刚体小物件 |
+
+### 层数是自适应的：有物体才拆，没物体就单层
+
+这是整套方案里最关键的一个判断，也是最容易做错的地方。
+
+双层的物理前提是「**有一个独立物体**」——物体的轮廓是真实的遮挡边界，
+卡片整体平移就等于物体在动，自洽。而风景照里没有物体，深度片切出来的
+是一大块不规则的「近景板」（船头甲板、前景礁石）。把它当卡片平移 86px，
+等于把一大片真实像素整体拖走：拖走的内容既不属于那个深度，也不会带回
+自己的次生视差，越看越怪，而且要在旁边补一条很宽的带子。
+
+所以规则是：
+
+| 语义分割结果 | 层数 | 相对位移 | 需要生成 |
+| --- | --- | --- | --- |
+| 可信（有明确主体，占画面 3%~30%） | 2 层 | 3~4% 画宽 | 剪影内一条带 |
+| 不可信（守卫触发：面积 > 30% / 外接框 > 55% / 宽 > 85% / 高 > 90%） | **1 层** | 0 | **完全不需要** |
+
+单层时整张照片就是一张卡片，微微前移，**没有任何需要凭空生成的地方，
+零瑕疵**。人在看远处风景时本来就几乎没有视差，这个选择在感知上也是对的。
+
+**生成式多视角**（用户提的方案之一）单独说：它确实能给出「视角变换后」的完整画面，
+但把两张生成图当渲染层用会有一个死结——生成图和原图**不可能逐像素对齐**，
+中间位置只能靠交叉淡化，出来的效果是「逐渐融化」而不是「移动」。
+它真正有价值的地方不是渲染层，而是**给背景板提供透视正确的延展内容**（见第五节 C）。
+
+**单图生 3D + 贴图**（另一个方案）单独说，见第六节。
+
+---
+
+## 四、资产规范
+
+一套卡片 = 两个图 + 一个 json，共 200 KB 左右：
+
+| 文件 | 尺寸 | 内容 | 从哪来 |
+| --- | --- | --- | --- |
+| `bg.jpg` | 照片 × (1+2·pad)，默认 pad=10% | 背景板：**没有主体**，四周续过 | 生成式（唯一必须生成的资产） |
+| `subj.png` | 主体外接框 + 6px | 主体卡片：**原图真实像素** + 软 alpha，已去边色 | 抠图，不要生成 |
+| `meta.json` | — | 层、深度、裁剪框、QA 数据 | 脚本产出 |
+
+```json
+{
+  "version": 3, "mode": "cards",
+  "image": { "w": 960, "h": 600 },
+  "scene": { "zRef": 0.60, "halfWM": 0.35, "eyeMax": 0.075 },
+  "pad":   { "x": 96, "y": 60 },
+  "layers": [
+    { "id": "bg",   "file": "bg.jpg",   "z": 1.60, "order": 0, "rect": [-96, -60, 1152, 720] },
+    { "id": "subj", "file": "subj.png", "z": 0.35, "order": 1, "rect": [152, 214, 470, 340] }
+  ],
+  "qa": { "reveal_px": 36.9, "pad_px": 60, "pad_ok": true }
+}
+```
+
+`rect` 是相对**原照片左上角**的矩形，允许负值（背景板总是负的）。
+渲染端只做一件事：`drawImage(img, origin + rect·s + parallax(z))`。
+
+### 为什么主体卡片必须用真实像素，不能生成
+
+1. **身份/质感**：生成模型会把笔电的划痕、布料的织法、皮肤的毛孔全部重画一遍，
+   和原图放一起就是「换了个东西」；
+2. **边缘**：生成图的 alpha 边缘永远比真实抠图软，一移动就是一圈雾；
+3. **规模**：主体卡片只占画面 20%，不生成也就没有一致性问题。
+
+生成只用在**看不见的地方**：主体背后、原图之外。
+
+### 三条硬约束（脚本已自动检查）
+
+1. `pad ≥ reveal × 1.15`，否则背景板自己会先露出边；
+2. 主体 alpha 过渡宽度 1.5~2px，用原图亮度吸附（`soft_alpha`）；
+3. 半透明像素必须**去边色**（`decontaminate`）：`F = (I − (1−a)·B) / a`，
+   否则原背景的颜色会跟着卡片一起移动，成为一圈亮毛。
+
+---
+
+## 五、生成路线：三种资产，三种提示词
+
+### A. 背景板（必须生成）
+
+**目标**：把主体抹掉、把画面往四周续 10%，其余一切（透视、砖缝走向、景深虚化程度、
+白平衡）都不许变。
+
+这是唯一真正需要生成模型的资产。两步走比一步稳：
+
+**第 1 步 · 去主体**（输入：原照片）
+
+```
+Remove the laptop from the image completely. Fill the area it occupied with what is
+behind it: the beige ceramic subway tiles of the wall (matching the existing brick
+pattern, mortar line width and alignment) and the warm wooden table surface.
+Keep everything else pixel-identical: same camera angle, same perspective, same
+shallow depth of field, same white balance, same grain. Do not add, move or restyle
+any other object. The result must look like the same photograph taken a moment
+later with the laptop gone.
+```
+
+负向：`laptop, keyboard, screen, apple logo, extra objects, new furniture, sharpened details, HDR, oversaturated, text, watermark, border, frame, vignette`
+
+**第 2 步 · 外扩**（输入：第 1 步的结果）
+
+```
+Extend this photograph outward by about 10% on every side, continuing the same scene.
+Continue the ceramic tile grid with identical tile size, mortar width and perspective
+convergence. Continue the wooden table planks with the same grain direction and the
+same focus falloff. The added area must be indistinguishable from the original edges;
+no vignette, no fade to a flat color, no mirrored repetition, no new objects.
+```
+
+外扩是模型最容易翻车的一步（常见病：边缘发灰、砖缝错位、镜像重复）。
+**兜底方案**：本地 `outpaint()` 用「LaMa 定走势 + 镜像借高频」，1.5 秒，能过验收。
+
+### B. 主体卡片（不要生成）
+
+`u2netp`（4.3 MB）抠粗轮廓 → 深度片补齐支撑面 → 距离场 1.6px 软边 → 引导滤波吸附 →
+去边色。需要更硬的抠图时换 **BiRefNet / RMBG-2.0**（ONNX int8 约 350 MB，离线可跑），
+人像可换 **MODNet**。
+
+### C. 视角偏移图（不用于渲染，用于「补带」和验收）
+
+**不要**把它当渲染层（见第三节）。它的两个正确用法：
+
+1. **给背景板提供透视正确的内容**：需要 ±7.5cm 视角图，取**画面边缘 15% 的环带**，
+   把环带贴到背景板上（原图区域一律保留原像素）。这比通用外扩准确得多。
+2. **验收**：把生成的左/右视图和「卡片栈渲染到 ±7.5cm 的截图」并排看，
+   差异就是这一版的可信度上限。
+
+提示词（`+`/`−` 二选一，数值对应 7.5cm @ 0.6m 眼距 ≈ 7° 视角）：
+
+```
+Same scene, same lighting, same moment. The camera (or the viewer's head) has moved
+about 7 centimetres to the left, so the laptop shifts about 40 pixels to the right
+relative to the background, and slightly more of the wall behind its left edge becomes
+visible. Keep the subject identical — same shape, same materials, same details, same
+focus. Only the viewpoint changes, nothing else.
+```
+
+视角词的稳定性排序（实测，从稳到不稳）：
+`viewer's head moved N cm to the left` > `camera panned slightly left` >
+`shot from 7 degrees left` > `slightly different angle`（后者基本等于重画）
+
+### 参数建议
+
+| 项 | 本地 Qwen-Image-2.1 | 云端（同类模型） |
+| --- | --- | --- |
+| 尺寸 | 512² 草稿确认构图 → 1024 定稿 | 与照片同比，长边 ≥ 1280 |
+| 步数 | 6（turbo）/ 8（文字、砖缝密集） | 20~30 |
+| 参考图 | ComfyUI `images.image_1` | image + mask（有 mask 接口就用） |
+| 一致性 | 固定 seed，只改提示词 | 同左 |
+| 验收 | 见第七节 | 同左 |
+
+---
+
+## 六、「图片 + 3D 模型贴图」这条路
+
+结论先说：**只对刚性小物件值得，对人物/植物/毛发是负收益。**
+
+| 主体类型 | 单图生 3D（Hunyuan3D / TRELLIS / Tripo） | 判断 |
+| --- | --- | --- |
+| 笔电、瓶子、鞋、相机、家具 | 形体会略胖，但轮廓对，贴原图当 albedo 后可用 | ✅ 值得 |
+| 人物、宠物、头发、树枝、透明物 | 背面全凭想象，边缘永远糊，一动就露馅 | ❌ 不做 |
+| 大面积场景（墙、海、街） | 几何完全不可信，等于把照片揉成团 | ❌ 不做 |
+
+如果要做，必须是**混合**而不是替代：
+
+```
+背景（卡片，1 张）  +  主体（3D mesh，1 个）  →  同一个离轴相机里合成
+```
+
+要点：
+1. mesh 只用**单视角可见部分**，背面用生成的补片，不做全封闭体积；
+2. 贴图必须**用原照片投影烘焙**（camera projection bake），不要用生成式贴图——
+   生成式贴图必变色；
+3. 主体与背景的遮挡用深度缓冲，别再用 alpha 排序。
+
+成本：每个主体 3~5 分钟 + 一次人工检查；收益是「主体绕看」而不是「主体平移」。
+**在当前 7.5cm 眼位、37px 位移的场景里，收益接近于零**——这就是不建议现在做的原因。
+
+---
+
+## 七、验收清单
+
+自动（`make_cards.py` 已输出）：
+
+- [ ] `pad_ok: true`（外扩够不够盖住背景板自己的位移）
+- [ ] `reveal_pct ≤ 4.5%`（超过时凭空造的面积太大，观感一定掉）
+- [ ] 主体占比 3%~30%（低于 3% 说明抠图失败，高于 30% 说明抠到了支撑面）
+
+人工（推到 ±7.5cm 各截一张，2 倍放大看三处）：
+
+- [ ] 主体轮廓：无台阶、无亮边、无半透明雾
+- [ ] 剪影两侧：露出的内容与该处背景同类（颜色、纹理方向、虚化程度）
+- [ ] 画面四边：无白斑、无纯色补丁、无硬接缝
+- [ ] 回中位：与原图逐像素差 < 2（卡片栈在中心位应当是**无损**的）
+
+---
+
+## 八、操作
+
+```bash
+# 本地路线：一条命令，约 13 秒
+python3 tools/make_cards.py img/near.jpg img/near.bin cards/near
+
+# 用外部生成好的背景板（云模型产出的就是这一步）
+python3 tools/make_cards.py img/near.jpg img/near.bin cards/near --plate ~/Desktop/plate.png
+
+# 调整立体感（数字越小越"贴脸"，露出带越宽）
+python3 tools/make_cards.py ... --z-subj 0.25 --z-bg 1.8
+
+# 强制层数（默认 auto：有独立主体 2 层，风景照 1 层）
+python3 tools/make_cards.py ... --layers 1
+
+# 预览
+open "http://127.0.0.1:8126/cards.html?cards=cards/near"
+```
+
+`cards.html` 里鼠标移动即眼位，底部滑杆和「自动摆动」用于连续观察，
+按方向键可以一档一档推。
+
+### 实测（两张差异很大的照片）
+
+| | `img/near.jpg` 970×600 桌面笔电 | `img/mid.jpg` 1280×800 船头与鸬鹚 |
+| --- | --- | --- |
+| 语义结果 | 可信（笔电，19.9%） | 守卫触发（桥/船当主体） |
+| 层数 | 2 | 1 |
+| 露出带 | 3.84% 画宽 | 0 |
+| 中心位与原图差异 | 均值 0.5/255，99% 像素 < 3/255 | 单层，除 JPEG 外无损 |
+| 产物 | bg 110 KB + subj 104 KB | bg 428 KB |
+| 耗时 | 13 s | 9 s |

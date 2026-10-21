@@ -1,0 +1,39 @@
+{
+  "version": 3,
+  "mode": "cards",
+  "image": {
+    "w": 1280,
+    "h": 800
+  },
+  "scene": {
+    "zRef": 0.6,
+    "halfWM": 0.35,
+    "eyeMax": 0.075
+  },
+  "pad": {
+    "x": 128,
+    "y": 80
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "file": "bg.jpg",
+      "z": 1.6,
+      "order": 0,
+      "rect": [
+        -128,
+        -80,
+        1536,
+        960
+      ]
+    }
+  ],
+  "qa": {
+    "reveal_pct": 2.92,
+    "shift_subject_px": 86.6,
+    "shift_background_px": 37.4,
+    "reveal_px": 37.4,
+    "pad_px": 80,
+    "pad_ok": true
+  }
+}

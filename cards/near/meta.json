@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "mode": "cards",
+  "image": {
+    "w": 960,
+    "h": 600
+  },
+  "scene": {
+    "zRef": 0.6,
+    "halfWM": 0.35,
+    "eyeMax": 0.075
+  },
+  "pad": {
+    "x": 96,
+    "y": 60
+  },
+  "layers": [
+    {
+      "id": "bg",
+      "file": "bg.jpg",
+      "z": 1.6,
+      "order": 0,
+      "rect": [
+        -96,
+        -60,
+        1152,
+        720
+      ]
+    },
+    {
+      "id": "subj",
+      "file": "subj.png",
+      "z": 0.35,
+      "order": 1,
+      "rect": [
+        96,
+        215,
+        469,
+        339
+      ]
+    }
+  ],
+  "qa": {
+    "reveal_pct": 3.84,
+    "shift_subject_px": 65.0,
+    "shift_background_px": 28.1,
+    "reveal_px": 36.9,
+    "pad_px": 60,
+    "pad_ok": true
+  }
+}
