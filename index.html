@@ -166,6 +166,13 @@
 </script>
 </head>
 <body>
+<div id="archBanner" style="position:fixed;left:0;right:0;top:0;z-index:99;display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:9px 14px;background:#2a1d0c;border-bottom:1px solid #5c4519;font:13px/1.5 -apple-system,'PingFang SC',sans-serif;color:#f0d9a8">
+  <b style="color:#ffcf6b">这一页是旧的「深度网格」方案</b>
+  <span style="opacity:.85">逐像素深度搬进几何，轮廓必然有锯齿和撕裂 —— 参数调不完，已换成卡片栈。</span>
+  <a href="cards.html" style="color:#7fd7ff;text-decoration:none;border-bottom:1px dashed currentColor">→ 打开新的「卡片栈」方案</a>
+  <button onclick="this.parentNode.remove()" style="margin-left:auto;background:none;border:1px solid #5c4519;color:#f0d9a8;border-radius:6px;padding:2px 9px;cursor:pointer">知道了</button>
+</div>
+<div style="height:56px"></div>
 <div id="app"></div>
 
 <div id="fileWarn">

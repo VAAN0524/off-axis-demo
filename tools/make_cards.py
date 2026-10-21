@@ -158,6 +158,60 @@ def ring_fill(lama, img, ring, win=512, stride=256, feather=40):
     return np.clip(out, 0, 1)
 
 
+# ── 色调：让补出来的内容采纳"洞外真实像素"的局部色温 ─────────────────
+def tone_match(fill, rgb, hole, ring_px=22, sigma=11.0):
+    """
+    LaMa 补露出带，结构对、**色温却常跟周围差一截** —— 一面暖米色的砖墙，
+    它补出一块偏冷偏灰的平滑色。眼一移，那条补出来的带子就是"贴上去的一块"，
+    边界上还有一条看得见的线。
+
+    正确参考只能来自**洞外的真实像素**（洞内是我们要造的东西，不能当参照）。
+    做法是归一化卷积求"周围真实像素的局部平均色"，只把差值加上去：
+
+        low_out = Gaussian(rgb · m) / Gaussian(m)      m = 洞外
+        out     = fill + (low_out - Gaussian(fill))
+
+    只补低频，模型给的纹理原封不动 —— 边界两侧色温一致，线自然消失。
+    """
+    m = (~hole).astype(np.float32)
+    num = np.stack([ndi.gaussian_filter(rgb[..., c] * m, sigma) for c in range(3)], -1)
+    den = np.maximum(ndi.gaussian_filter(m, sigma), 1e-4)[..., None]
+    low_out = num / den
+    low_fill = np.stack([ndi.gaussian_filter(fill[..., c], sigma) for c in range(3)], -1)
+    return np.clip(fill + (low_out - low_fill), 0, 1)
+
+
+# ── 露出带：调和插值（迭代扩散），边界条件 = 洞外真实像素 ─────────────
+def harmonic_fill(rgb, src, band, iters=14):
+    """
+    洞里每一轮做一次高斯，再把洞外强制恢复成原图：
+
+        out ← Gaussian(out)      只在洞内生效
+        out ← rgb                洞外永远是真实像素
+
+    收敛后洞内是"以洞外像素为边界条件的最小曲率曲面"，即调和插值。
+    相比各种"平均色"的填法，它多出两个关键性质：
+
+    · **只受最近那圈边界约束**，远处的过曝墙 / 暗桌掺不进来（归一化高斯
+      sigma=15 时，笔电左上角那片很亮的墙会被算进洞里，补出来比真实墙
+      亮一大截 —— 左移时就是一块白板）；
+    · **边界上严格等于原值**，不会有接缝、也不会有虚化描边。
+
+    两个参数是绑死的：sigma 取 band/4，迭代 14 轮 → 等效扩散半径
+    ≈ sigma·√14 ≈ 0.93·band，刚好覆盖整个洞。
+
+    **不要用"残差不变就早停"**：洞中心在头几轮本来就完全不动（扩散还没
+    走到），max|Δ| 一直很小，会立刻误判收敛，然后洞里还是原图的笔电轮廓
+    —— 背景板上那条虚线斜边就是这么来的。
+    """
+    sigma = max(4.0, band / 4.0)
+    out = rgb.copy()
+    for _ in range(iters):
+        sm = np.stack([ndi.gaussian_filter(out[..., c], sigma) for c in range(3)], -1)
+        out = np.where(src[..., None], rgb, sm)
+    return np.clip(out, 0, 1)
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
@@ -169,6 +223,9 @@ def main():
     mirror_hf = argval('--mirror-hf', 0.5)
     max_side = argval('--max-side', 1600, int)
     use_lama = '--no-lama' not in sys.argv
+    ring_mode = 'smooth'
+    if '--ring' in sys.argv:
+        ring_mode = sys.argv[sys.argv.index('--ring') + 1]
     plate_path = None
     if '--plate' in sys.argv:
         plate_path = sys.argv[sys.argv.index('--plate') + 1]
@@ -206,9 +263,18 @@ def main():
             # 水面这种横贯画面的东西整块当主体，用它抠图等于把照片撕掉半张。
             ys, xs = np.nonzero(obj)
             bw, bh = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+            # 两条最硬的判据，都是"形状"层面的：
+            # · **贴边**：独立物体（笔电、瓶子、人）四周一定留空隙；桥、
+            #   城墙、海平线这类横贯画面的东西会一直顶到画面边上。
+            # · **宽度占比**：实测大桥那张 bbox 是 81%×29% —— 面积只有 19%，
+            #   又宽又扁，就是一条横带，不是物体。阈值取 0.60：真的独立物体
+            #   很少占掉六成画面宽度，而误判成单层的代价（少一点视差）远小于
+            #   误判成双层的代价（移动时露出补出来的糊块）。
+            touch = (obj[0].mean() > 0.10) + (obj[-1].mean() > 0.10) \
+                + (obj[:, 0].mean() > 0.10) + (obj[:, -1].mean() > 0.10)
             if (obj.mean() > 0.30 or (bw * bh) / float(W * H) > 0.55
-                    or bw > W * 0.85 or bh > H * 0.9):
-                print('语义守卫触发：没有可拆的独立主体')
+                    or bw > W * 0.60 or bh > H * 0.85 or touch >= 2):
+                print(f'语义守卫触发：没有可拆的独立主体（贴边 {touch} 条）')
                 obj = np.zeros((H, W), bool)
                 guard_hit = True
 
@@ -234,6 +300,13 @@ def main():
         if not auto_single and not forced_single:
             print('!! 找不到主体，退化成单张卡片')
         subject = np.zeros((H, W), bool)
+    elif subject.any():
+        # 语义遮罩会在物体**内部**挖洞：u2netp 对一块深色反光的屏幕经常
+        # 只给到 0.3~0.4 的置信度，于是笔电屏幕上破了一个大洞。洞本身不大，
+        # 后果却很大 —— 卡片在那里 alpha < 1，背景板（已经抹掉笔电、补成墙色）
+        # 就从屏幕里透上来，看起来是"笔电上糊了一团白雾"。
+        # 填洞是安全操作：主体是连通的实体，内部不该有洞。
+        subject = ndi.binary_fill_holes(subject)
 
     alpha = B.soft_alpha(subject, lum) if subject.any() else np.zeros((H, W), np.float32)
     if subject.any():
@@ -279,14 +352,89 @@ def main():
         print(f'背景板：{plate_path}')
     else:
         if subject.any():
-            hole_full = ndi.binary_dilation(subject, B.disk(7))
-            filled = ring_fill(lama, rgb, hole_full) if lama is not None else B.push_pull(bg, ~hole_full)
-            # 替换范围必须**和卡片的 alpha 对齐**（paint = alpha>0.05），不能用
-            # 主体遮罩本身：遮罩边缘那 2px 里 alpha 可能是 0.02，一旦那里被抹掉，
-            # 中心位就会从"卡片几乎透明"的地方漏出补出来的内容（实测船景有 832 个
-            # 像素的误差超过 8/255）。卡片不画的像素，背景板就一定保留原样。
-            paint = alpha > 0.12   # 与 decontaminate 的 lo 一致，见那里
-            bg = np.where(paint[..., None], filled, rgb)
+            # 只修"轮廓内侧 band 宽的一圈"。
+            #
+            # 这一版之前是把整块主体（469×339，占画面 15%）当洞送进 LaMa，
+            # 结果背景板中间糊出一大片灰白的雾，还带一条斜接缝 —— 因为那个洞
+            # 同时跨了砖墙和桌面两种材质，模型没有"这里是一张桌子"的概念，
+            # 只能填最省事的均值。眼一移，那片雾就当作"白斑"露出来。
+            #
+            # 而按位移预算算过：主体相对背景最多错开 reveal 像素，所以**只有
+            # 紧贴轮廓内侧、宽度 = reveal 的那一圈**会被露出来。更深处永远被
+            # 卡片盖着，补它不但没用，还把洞撑大、把补全质量拉垮。
+            # 抹除范围要比语义遮罩**外扩 3px**。
+            #
+            # u2netp 在阈值 0.5 处切出来的边界，通常比物体真实轮廓**内缩**
+            # 2~3px —— 而物体最深处的那条暗边、反光边恰恰就在这 2~3px 里。
+            # 只按遮罩抹，轮廓会被完整留在背景板上：眼一移，那道虚线状的
+            # 斜边就从背景里浮出来（放大看是断续的点，因为遮罩边界是像素锯齿）。
+            #
+            # alpha 仍然用原遮罩，所以卡片剪影一点都不变。
+            erase = ndi.binary_dilation(subject, B.disk(3))
+            sp = band + 6
+            erase_pad = np.pad(erase, sp, constant_values=True)
+            dist_in = ndi.distance_transform_edt(erase_pad)[sp:-sp, sp:-sp]
+            ring = erase & (dist_in < band)
+
+            # 替换边界必须**离开轮廓** 5px。
+            #
+            # 严格的替换边界就是遮罩边界，而遮罩是像素级的 —— 边界本身带
+            # 1px 锯齿。就算两测色差只有 5%，那条锯齿在放大后也是一条断续的
+            # 虚线（就是"边缘一圈毛"的最后一层来源）。把边界推到轮廓外 5px
+            # 的墙里，两测就都是墙色，锯齿无从显现。
+            #
+            # 代价：轮廓外 5px 的墙是补的，静止时那 5px 与原图差百分之几。
+            # 但卡片 alpha 在最外 2px 就掉到 0 了，decontaminate 又把 a>0.12
+            # 的那段反解回原值 —— 真正裸奔的只有 1~2px，肉眼不可见。
+            hole = ndi.binary_dilation(ring, B.disk(5))
+            if ring_mode == 'lama' and lama is not None:
+                # 洞的输入图里，**整个主体 + 它的边界**都要抹平。
+                #
+                # 这里有两层坑，叠在一起：
+                # 1. LaMa 是整图重建模型，在 mask 边界处倾向于**复制输入**
+                #    （它也被训练成洞外要还原）。所以只要输入里还留着轮廓，
+                #    补出来的背景板上轮廓就原封不动 —— 眼一移就是第二台笔电。
+                # 2. 而 u2netp 的遮罩边界本身有 1~2px 锯齿，正好压在笔电最深的
+                #    那条轮廓线上。只抹 subject 内部的话，这条断续的深色点线会
+                #    留在 mask 外面，被模型当成"该延续的边缘"复制进去。
+                #
+                # 所以抹平范围要比 subject **外扩 3px**，让轮廓整条消失。
+                grow = ndi.binary_dilation(subject, B.disk(3))
+                fill = B.push_pull(rgb, ~grow)
+                pre = np.where(grow[..., None], fill, rgb)
+                if '--debug' in sys.argv:
+                    Image.fromarray((np.clip(pre, 0, 1) * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_pre.png'))
+                    Image.fromarray((ring * 255).astype(np.uint8)).save(
+                        os.path.join(outdir, '_dbg_ring.png'))
+                bg = np.where(hole[..., None], tone_match(ring_fill(lama, pre, hole), rgb, hole), rgb)
+            else:
+                # 露出带的填充：最近的**真实背景**像素 + 局部模糊。
+                #
+                # 三个都试过，只有这条能用：
+                # · LaMa 整块：洞跨砖墙/桌面两种材质，补出一片雾，还沿着轮廓
+                #   糊出一条污浊的斜带；
+                # · LaMa 只修一圈：它在 mask 边界复制输入，笔电轮廓原样留下，
+                #   眼一移就是第二台笔电；
+                # · push_pull：多尺度金字塔一路降到 6px，洞中心拿到的其实是
+                #   **整幅图的平均色**——一块灰白的雾，正是"白斑"。
+                #
+                # 距离场取最近背景像素，颜色一定来自**最近的**那片材质；
+                # 再模糊 9px 抹掉 Voronoi 分界。57px 宽的带里，这就是
+                # "没有这台笔电时，那里应该是墙/桌面"最接近的估计。
+                # src 一定要是**整个主体之外**，不能只排掉轮廓外 5px：
+                # 洞（dilate(ring,5)）的内侧边界落在主体深处，而那里原本
+                # 还在 src 里 —— 调和插值就变成"墙 ↔ 笔电机身"的过渡，
+                # 补出一根比周围亮的竖条（左移时最显眼的那块）。
+                # 主体内部一律不可信，只留真背景当边界条件。
+                src = ~erase
+                fill = harmonic_fill(rgb, src, band)
+                # 替换边界必须**羽化**。边界是像素级的，遮罩本身带 1px 锯齿，
+                # 就算两侧色差只有 3%，硬切在放大后也是一条断续的虚线
+                # （"边缘一圈毛"的最后一层）。这里羽化半径 ~2px，两侧都是墙，
+                # 过渡完全看不出来。
+                w = np.clip(ndi.gaussian_filter(hole.astype(np.float32), 1.6), 0, 1)
+                bg = rgb * (1 - w[..., None]) + fill * w[..., None]
         bg = np.clip(bg, 0, 1)
         bg = outpaint(lama, bg, pad_x, pad_y, mirror_hf)
 

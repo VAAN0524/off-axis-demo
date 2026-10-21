@@ -17,3 +17,6 @@ img/*_depth.png
 
 # 烘焙中间产物（out_ldi 是旧管线留下的，已并入 ldi/）
 out_ldi/
+
+# 烘焙诊断图（--debug 时才产出）
+cards/*/_dbg_*.png
