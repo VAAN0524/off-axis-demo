@@ -265,33 +265,74 @@ python tools/pack_wasm.py    # wasm 9.0MB → gzip 2.7MB → base64 3.7MB 的普
 顺带一个附带收获：`file://` 打开现在也能跑（`import` 跨域 CDN 模块放行，wasm 走内置副本），不必再起本地服务。
 
 
-## 第四层：三条通道先探测，再决定怎么走
+## 第四层：真正的凶手是 `blob:`，不是 fetch
+
+前面几层都在猜"哪个源不通"。最后用 `window.fetch` 包一层记录才发现：**下载全都成功了，挂在最后一步 —— 把 `blob:` URL 交给 emscripten。**
+
+WorkBuddy 预览服务器的 CSP 长这样（逐字抄自响应头）：
+
+```
+default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:;
+connect-src 'self' http://127.0.0.1:* https://*.map.qq.com …
+```
+
+`default-src` 里明明有 `blob:`，但 **`connect-src` 显式列了源、却没有 `blob:`** —— 而 `connect-src` 是独立生效的，不继承 `default-src` 的 `blob:`。于是：
+
+| 动作 | 结果 |
+| --- | --- |
+| `fetch('wasm/…wasm')` 同源下载 9.4 MB | ✓ 成功 |
+| `URL.createObjectURL(bytes)` | ✓ |
+| **`fetch(blob:…)`（emscripten 去取 wasm）** | ✗ Chrome `Failed to fetch` / Firefox `NetworkError…` |
+
+因为失败发生在最后一步，**五个源报的是同一句话**，看起来就像"全都不通"。我第一次看到这个报错时把源换了一轮，方向从一开始就偏了。
+
+修法：探测一次 blob 通道（一个 1 字节的 blob，代价可忽略），
+
+- `blob` 通 → 保持原方案（自己下载 + 进度条 + 魔数校验，交给 MediaPipe 的文件是 blob URL）
+- `blob` 堵 → 把 `FilesetResolver` 给的**原始同源 URL** 直接交给 emscripten，让它自己按 `'self'` 去取（这一步是 CSP 放行的）
+
+面板会把这四件事分开显示，一眼能看出卡在哪：
+
+```
+通道 fetch 通 · xhr 通 · script 通 · blob 堵
+```
+
+`tools/csp_server.py` 就是用来复刻这个环境的：它逐字带上预览服务器的 CSP，起在 `127.0.0.1:8127`，用来验证"blob 被拦时能不能退回直连"。实测同一份代码：
+
+| 环境 | 通道 | `state.trackerMode` |
+| --- | --- | --- |
+| 普通 `python3 -m http.server` | `… · blob 通` | `mp`（走 blob，有进度） |
+| 带预览 CSP | `… · blob 堵` | `mp`（走同源直连） |
+
+
+## 第五层：三条通道先探测，再决定怎么走
 
 Firefox + `http:` 的实例里连 5 个来源都报同一句 `NetworkError when attempting to fetch resource.` —— 这时候再往下堆源是白费力气，得先回答"这台环境的哪条通道是活的"。
 
-`fetch` / `XHR` / `<script src>` 是**三条互相独立**的通道：
+`fetch` / `XHR` / `<script src>` / `blob:` 是**四条互相独立**的通道：
 
-| 谁在拦 | fetch | XHR | `<script src>` | `import()` |
-| --- | --- | --- | --- | --- |
-| CSP `connect-src` | ✗ | ✗ | ✓ | ✓（`script-src`） |
-| 只改写了 `window.fetch` 的插件 | ✗ | ✓ | ✓ | ✓ |
-| `file://` / `sandbox` iframe | ✗ | ✗ | ✓ | ✗ |
-| 服务器把 9.4 MB 掐断 | ✗ | ✗ | — | — |
+| 谁在拦 | fetch | XHR | `<script src>` | `blob:` | `import()` |
+| --- | --- | --- | --- | --- | --- |
+| CSP `connect-src` | ✗ | ✗ | ✓ | ✗ | ✓（`script-src`） |
+| CSP `connect-src` 没列 `blob:`（本项目真凶） | ✓ | ✓ | ✓ | ✗ | ✓ |
+| 只改写了 `window.fetch` 的插件 | ✗ | ✓ | ✓ | ✓ | ✓ |
+| `file://` / `sandbox` iframe | ✗ | ✗ | ✓ | ✓ | ✗ |
+| 服务器把 9.4 MB 掐断 | ✗ | ✗ | — | — | — |
 
-所以页面在取摄像头的同时，用两个 2 字节的侦察文件（`wasm/ping.txt`、`wasm/ping.js`）各探一次，结论显示在面板的一行小字里：
+所以页面在取摄像头的同时，用两个 2 字节的侦察文件（`wasm/ping.txt`、`wasm/ping.js`）加一个 1 字节的 blob 各探一次，结论显示在面板的一行小字里：
 
 ```
-通道 fetch 堵 · xhr 通 · script 通
+通道 fetch 通 · xhr 通 · script 通 · blob 堵
 ```
 
 判定刻意放宽 —— **只要拿到响应就算通**。404 说明网络好、文件不对；只有抛异常才是通道被锁。这个区别决定后面要不要白等 4 次 30 s 超时。
 
-- fetch 通：本地 `wasm/` → 国内镜像 → jsDelivr → unpkg（原顺序不动）
+- fetch 通 + blob 通：本地 `wasm/` → 国内镜像 → jsDelivr → unpkg，自己下载并校验（有进度条）
 - fetch 堵、XHR 通：同一批源自动改走 XHR（`downloadBytes` 里兜的），进度条照旧
-- 两条都堵：跳过所有网络源，直接读内置副本（省掉 4 次注定失败的超时）
-- 连内置副本都读不到：**不再停在一句报错上**，见下一节
+- blob 堵：直接让 emscripten 读同源 URL，跳过 blob 转交（见上一节）
+- 网络与内置副本全堵：**不再停在一句报错上**，见下一节
 
-## 第五层：免下载追踪（纯 JS，不碰 wasm）
+## 第六层：免下载追踪（纯 JS，不碰 wasm）
 
 wasm、模型、CDN 全部不可达时，页面自动切到一个 40 行就能讲完的追踪器，永远能起来：
 
@@ -326,6 +367,7 @@ wasm、模型、CDN 全部不可达时，页面自动切到一个 40 行就能�
 - **`Aborted(both async and sync fetching of the wasm failed)` 不是模型问题**：是 9.4 MB 的 wasm 没下全，见上面「wasm 运行时」一节。同理，`-sASSERTIONS` 只会让错误更啰嗦，不会让它能跑。
 - **同一页只能有一份 MediaPipe runtime**：同时引入 legacy `@mediapipe/pose` 和新版 `tasks-vision` 会撞出两个 emscripten 实例，症状同样是各种 `Aborted`（官方 issue #5495）。
 - **`NetworkError when attempting to fetch resource.` 不是源坏了**：连本地相对路径都失败时，是这个环境把 fetch 通道整体掐了（`file://`、`sandbox` iframe 都这样）。此时 `import` 同源、`XHR` 也一起失败，但 classic `<script>` 和 `fetch(blob:)` 还通 —— 见上面「第三层」一节。
+- **`blob:` 也要单独探**：`connect-src` 不继承 `default-src` 里的 `blob:`。预览类环境（CSP 显式列了源却没列 blob）会放行 fetch、放行 script，却在"把 blob 交给 emscripten"这一步拒绝 —— 表现就是**所有源报同一句 NetworkError**，像极了源全挂。遇到这种报错先看面板的 `blob` 那一栏。
 - **别再靠"多加几个 CDN"解决 `NetworkError`**：五个源报同一句话时，问题在通道不在源。先看面板那行 `通道 fetch / xhr / script`，再去决定走哪条路。
 - **降级要用户看得见**：面板会写清「已切到免下载追踪 + MediaPipe 未启用的原因」，而不是把一段红色报错丢给用户。追踪本身不该因为 wasm 加载失败而不可用。
 - **GPU delegate 会静默卡死**：`baseOptions.delegate: 'GPU'` 在部分驱动上既不返回也不报错。检测本身是每 45 ms 一次，CPU 在 M 系列上 6–8 ms/帧完全够，所以只用 CPU。

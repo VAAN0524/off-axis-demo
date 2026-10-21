@@ -1139,7 +1139,7 @@ let probePromise = null;
 
 function laneText() {
   const g = (v) => (v === null ? '未测' : v ? '通' : '堵');
-  return `通道 fetch ${g(lanes.fetch)} · xhr ${g(lanes.xhr)} · script ${g(lanes.script)}`;
+  return `通道 fetch ${g(lanes.fetch)} · xhr ${g(lanes.xhr)} · script ${g(lanes.script)} · blob ${g(canBlobFetch)}`;
 }
 
 function renderLanes() {
@@ -1194,10 +1194,26 @@ function loadTinyScript(url) {
   });
 }
 
+/** 只问"有没有响应"，不看状态码 —— 探测专用（404 也算通道通） */
+function xhrPing(url, ms) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('GET', url, true);
+    x.timeout = ms;
+    x.onload = () => resolve();
+    x.onerror = () => reject(new Error('XHR NetworkError'));
+    x.ontimeout = () => reject(new Error('超时'));
+    x.onabort = () => reject(new Error('已取消'));
+    x.send();
+  });
+}
+
 /**
  * 侦察请求判定标准刻意放宽：只要"拿到了响应"就算通道活着。
  * 因为 404 说明网络好、文件不对；只有抛异常（NetworkError / CSP 拒绝）
  * 才是通道真的被锁 —— 这个区别决定了后面要不要浪费 4 次 30s 超时。
+ * 顺带探一次 blob: —— 它决定了 wasm 是"我们自己下载后交给 MediaPipe"
+ * 还是"直接让 emscripten 去抓原 URL"，见 filesetFromBlob。
  */
 function probeLanes() {
   if (probePromise) return probePromise;
@@ -1208,10 +1224,11 @@ function probeLanes() {
     const q = '?probe=' + Date.now();
     const [f, x, s] = await Promise.all([
       one(() => fetch('wasm/ping.txt' + q, { cache: 'no-store' }).then(() => {}), 5000),
-      one(() => xhrBytes('wasm/ping.txt' + q, { timeout: 5000 }), 6000),
+      one(() => xhrPing('wasm/ping.txt' + q, 5000), 6000),
       one(() => loadTinyScript('wasm/ping.js' + q), 7000),
     ]);
     lanes.fetch = f; lanes.xhr = x; lanes.script = s;
+    await probeBlobFetch();
     renderLanes();
     console.info('[net]', laneText());
     return lanes;
@@ -1253,14 +1270,35 @@ async function fetchBytes(url, { onProgress, timeout = 120000 } = {}) {
  *
  * 为什么不直接把路径丢给 forVisionTasks：那样下载、超时、重试全在 emscripten
  * 内部，我们既看不到进度，也没法在超时后干净地重来（半途被打断时它的内部
- * 状态就坏了，只会抛 Aborted）。fileset 本身只是
- *   { wasmLoaderPath, wasmBinaryPath }
- * 两个字符串，换成 blob: URL 一样能用 —— 这两行是实测打出来的。
+ * 状态就坏了，只会抛 Aborted）。
  *
- * 顺带解决三件事：能显示百分比；能在开跑前用魔数识别"下到一半的文件"；
- * 换源重试时前一次的失败状态不会残留。
+ * ⚠ 但 blob: 这条路**只在 CSP 的 connect-src 里包含 blob: 时才通**。
+ * WorkBuddy 预览服务器的 CSP 是
+ *   default-src 'self' … blob: data:;
+ *   connect-src 'self' http://127.0.0.1:* https://*.map.qq.com …
+ * connect-src 显式列了源、却没列 blob:，于是 fetch(blob:…) 被拒 ——
+ * Chrome 报 `Failed to fetch`、Firefox 报
+ * `NetworkError when attempting to fetch resource.`，而且**五个源报的是同一句话**，
+ * 因为前面下载都成功、挂在最后"把 blob 交给 emscripten"这一步。
+ * 这种情况就退回让 emscripten 直接抓同源的 http URL（CSP 允许 'self'）。
  */
 const wasmFilesetCache = new Map();
+/** blob: 能不能 fetch —— 一次几十字节的探测，换来一整类 CSP 的判断 */
+let canBlobFetch = null;
+async function probeBlobFetch() {
+  if (canBlobFetch !== null) return canBlobFetch;
+  try {
+    const u = URL.createObjectURL(new Blob(['x'], { type: 'text/plain' }));
+    const r = await withTimeout(fetch(u), 4000, 'blob 探测超时');
+    await r.arrayBuffer();
+    URL.revokeObjectURL(u);
+    canBlobFetch = true;
+  } catch {
+    canBlobFetch = false;
+  }
+  renderLanes();
+  return canBlobFetch;
+}
 
 async function filesetFromBlob(mp, base, onProgress) {
   // 页面加载会自动起一次追踪，用户再点「重启追踪」又是一次完整流程 ——
@@ -1273,6 +1311,15 @@ async function filesetFromBlob(mp, base, onProgress) {
   // 让官方实现去判断该用 SIMD 版还是 nosimd 版，我们只接管"谁来下载"
   const paths = await mp.FilesetResolver.forVisionTasks(base);
   const localBase = !/^https?:/i.test(base);
+
+  // blob 被 CSP 拦：别绕了，直接把原始 URL 交给 emscripten（它按 'self' 放行）
+  if ((await probeBlobFetch()) === false) {
+    onProgress?.(1);
+    console.info('[wasm] connect-src 不放行 blob:，改由 emscripten 直接读取', base);
+    const direct = { wasmLoaderPath: paths.wasmLoaderPath, wasmBinaryPath: paths.wasmBinaryPath };
+    wasmFilesetCache.set(base, direct);
+    return direct;
+  }
 
   // 同源失败是秒挂（CORS / 断网），不用给长预算；跨域要留够真实下载时间
   const jsTimeout = localBase ? 15000 : 30000;
@@ -1507,6 +1554,10 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
   };
 
   const packLane = async () => {
+    // 内置副本最终也是变成 blob: 交给 emscripten；CSP 不放行 blob: 时这条路注定不通
+    if (canBlobFetch === false) {
+      throw new Error('内置副本需要 blob: 通道，但当前 CSP 不放行 blob（改用同源直连即可）');
+    }
     onStatus?.('读取内置副本 3.7MB…');
     return build(await loadWasmPack(), 'pack', '内置副本');
   };
