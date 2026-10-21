@@ -1582,6 +1582,9 @@ function enableSimpleTracking(err) {
   markTrackingOn();
   setTrack('等待人头', 'ok');
   const why = err ? (err?.message || String(err)) : '';
+  // 模型读不到时留出手动选文件的入口；wasm 挂了选模型没用，不显示
+  const pick = document.getElementById('btnPickModel');
+  if (pick) pick.classList.toggle('show', /模型/.test(why));
   setTrackDetail(
     '已切到免下载追踪（纯 JS 肤色追踪，不碰 wasm 与模型），可以直接用。'
     + (why ? ' MediaPipe 未启用的原因：' + why : '')
@@ -1777,6 +1780,7 @@ const simpleTracker = (() => {
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   const mask = new Uint8Array(W * H);
   const seen = new Uint8Array(W * H);
+  const gray = new Uint8Array(W * H);
   const stack = new Int32Array(W * H);
   let box = null;      // 平滑后的 {cx, cy, size}
   let miss = 0;
@@ -1808,10 +1812,25 @@ const simpleTracker = (() => {
       }
       if (area < minArea) continue;
       const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+      if (bw > W * 0.85 || bh > H * 0.92) continue;  // 整幅都"像皮肤"：那是墙/暖光，不是脸
       const fill = area / (bw * bh);
       if (fill < 0.35) continue;                    // 细长条 / 花里胡哨的噪点
       const aspect = bw / bh;
       if (aspect < 0.45 || aspect > 2.2) continue;   // 脸+脖子大致在这个范围
+
+      // 脸内部一定有明暗结构（眼睛、鼻影）。均匀的色块多半是墙面或桌面。
+      // 隔 2 像素采样，最坏情况也就 1600 次加法。
+      let sum = 0, sum2 = 0, n = 0;
+      for (let y = y0; y <= y1; y += 2) {
+        for (let x = x0; x <= x1; x += 2) {
+          const g = gray[y * W + x];
+          sum += g; sum2 += g * g; n++;
+        }
+      }
+      const mean = sum / n;
+      const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+      if (std < 8) continue;                         // 一片平色：不可能是正脸
+
       const cx = sx / area / W;
       const cy = sy / area / H;
 
@@ -1857,6 +1876,7 @@ const simpleTracker = (() => {
         const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
         const hit = y > 45 && cb >= 77 && cb <= 130 && cr >= 133 && cr <= 178 && r > b + 8;
         mask[p] = hit ? 1 : 0;
+        gray[p] = y;
         if (hit) skin++;
       }
       // 整幅几乎都是"肤色"（暖光房间 / 贴太近）：分不出前景，这帧作废
