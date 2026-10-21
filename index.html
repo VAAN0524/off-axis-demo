@@ -104,7 +104,7 @@
   #btnYaw{ flex:0 0 78px; }
   #btnYaw:disabled{ color:#4d5568; cursor:not-allowed; }
 
-  #btnTrack, #btnOpen, #btnPickModel{
+  #btnTrack, #btnOpen, #btnPickModel, #btnSimple{
     width:100%; padding:7px 0; border-radius:8px; border:1px solid var(--line);
     background:rgba(255,255,255,.04); color:var(--ink); font:inherit; cursor:pointer;
     transition:background .15s,border-color .15s,color .15s;
@@ -113,11 +113,14 @@
   #btnOpen.show{ display:block; }
   #btnPickModel{ display:none; border-color:rgba(123,97,255,.45); color:#cfc6ff; }
   #btnPickModel.show{ display:block; }
-  #btnTrack:hover:not(:disabled), #btnOpen:hover, #btnPickModel:hover{ background:rgba(255,255,255,.09); }
+  #btnSimple{ border-color:rgba(78,201,140,.35); color:#9fe6c0; }
+  #btnSimple:disabled{ color:#5b6479; cursor:progress; }
+  #btnTrack:hover:not(:disabled), #btnOpen:hover, #btnPickModel:hover, #btnSimple:hover:not(:disabled){ background:rgba(255,255,255,.09); }
   #btnTrack:disabled{ color:#5b6479; cursor:progress; }
   #btnTrack.on{ border-color:rgba(78,201,140,.5); background:rgba(78,201,140,.14); color:#96e9bd; }
   #trackMsg{ color:#8a93a6; }
   #trackMsg.bad{ color:#ff9aa8; }
+  #trackLanes{ color:#5f6982; font-variant-numeric:tabular-nums; word-break:break-all; }
   .tip{ margin:0; font-size:11px; line-height:1.55; color:#646e86; }
 
   /* 底部提示 */
@@ -229,6 +232,8 @@
 
     <button id="btnTrack">启用摄像头追踪</button>
     <p class="tip" id="trackMsg">未启用：用鼠标移动模拟头部，滚轮模拟前后。</p>
+    <p class="tip" id="trackLanes"></p>
+    <button id="btnSimple">免下载追踪（不依赖 wasm，立即可用）</button>
     <button id="btnOpen">在新窗口打开（嵌入预览常拦截摄像头）</button>
     <button id="btnPickModel">选择模型文件…（可用 models/face_landmarker.task）</button>
     <input id="fileModel" type="file" accept=".task" hidden />
@@ -293,13 +298,14 @@ const params = {
 };
 
 const state = {
-  tracking: false,   // MediaPipe 是否就绪
+  tracking: false,   // 追踪是否就绪（两种追踪器都算）
   live: false,       // 当前是否检到人脸
   backend: '—',
   ipdPx: 0,
   pointerZ: 0.6,
   splat: null,
   wasmBase: null,    // 这次是用哪档 wasm 起来的（诊断用）
+  trackerMode: null, // 'mp' = 478 点关键点 / 'simple' = 免下载色块
 };
 
 /* ── 屏幕物理尺寸：由对角线 + 当前视口比例推出来 ────────────────── */
@@ -1120,6 +1126,99 @@ function wasmErrorText(e) {
   return e?.message || String(e);
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   传输通道：fetch / XHR / script —— 三条是**互相独立**的
+     · CSP 的 connect-src 只锁 fetch 与 XHR，管不到 <script src>
+     · 有些隐私插件只改写 window.fetch，XHR 还是原生的
+     · file:// 和 sandbox iframe 里三条可以全挂（那时只剩页面本身）
+   启动时各发一个几百字节的侦察请求，把结论写进面板：
+   下次再失败，一眼能分清是「通道被拦」还是「文件本来就不在」。
+   ══════════════════════════════════════════════════════════════════ */
+const lanes = { fetch: null, xhr: null, script: null };
+let probePromise = null;
+
+function laneText() {
+  const g = (v) => (v === null ? '未测' : v ? '通' : '堵');
+  return `通道 fetch ${g(lanes.fetch)} · xhr ${g(lanes.xhr)} · script ${g(lanes.script)}`;
+}
+
+function renderLanes() {
+  const el = document.getElementById('trackLanes');
+  if (el) el.textContent = lanes.fetch === null ? '' : laneText();
+}
+
+/** XHR 版下载：fetch 被拦时的同一份数据、另一条系统调用路径 */
+function xhrBytes(url, { onProgress, timeout = 120000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    let settled = false;
+    const done = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+    x.open('GET', url, true);
+    x.responseType = 'arraybuffer';
+    x.timeout = timeout;
+    x.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total, e.loaded, e.total);
+    };
+    x.onload = () => {
+      if (x.status < 200 || x.status >= 300) return done(reject, new Error('HTTP ' + x.status));
+      const buf = x.response;
+      if (!buf || !buf.byteLength) return done(reject, new Error('响应为空'));
+      done(resolve, new Uint8Array(buf));
+    };
+    x.onerror = () => done(reject, new Error('XHR NetworkError'));
+    x.ontimeout = () => done(reject, new Error('下载超时'));
+    x.onabort = () => done(reject, new Error('已取消'));
+    x.send();
+  });
+}
+
+/** 先 fetch，失败再用 XHR 走一遍 —— 只多花一次握手，能救回一整类环境 */
+async function downloadBytes(url, opts = {}) {
+  if (lanes.fetch !== false) {
+    try { return await fetchBytes(url, opts); } catch (e) {
+      if (lanes.xhr === false) throw e;
+      console.warn('[net] fetch 失败，改用 XHR 重试', url, e?.message || e);
+    }
+  }
+  return xhrBytes(url, opts);
+}
+
+function loadTinyScript(url) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    const timer = setTimeout(() => reject(new Error('超时')), 8000);
+    s.onload = () => { clearTimeout(timer); resolve(); };
+    s.onerror = () => { clearTimeout(timer); reject(new Error('被拦截')); };
+    s.src = url;
+    document.head.appendChild(s);
+  });
+}
+
+/**
+ * 侦察请求判定标准刻意放宽：只要"拿到了响应"就算通道活着。
+ * 因为 404 说明网络好、文件不对；只有抛异常（NetworkError / CSP 拒绝）
+ * 才是通道真的被锁 —— 这个区别决定了后面要不要浪费 4 次 30s 超时。
+ */
+function probeLanes() {
+  if (probePromise) return probePromise;
+  const one = async (fn, ms) => {
+    try { await withTimeout(fn(), ms, '超时'); return true; } catch { return false; }
+  };
+  probePromise = (async () => {
+    const q = '?probe=' + Date.now();
+    const [f, x, s] = await Promise.all([
+      one(() => fetch('wasm/ping.txt' + q, { cache: 'no-store' }).then(() => {}), 5000),
+      one(() => xhrBytes('wasm/ping.txt' + q, { timeout: 5000 }), 6000),
+      one(() => loadTinyScript('wasm/ping.js' + q), 7000),
+    ]);
+    lanes.fetch = f; lanes.xhr = x; lanes.script = s;
+    renderLanes();
+    console.info('[net]', laneText());
+    return lanes;
+  })();
+  return probePromise;
+}
+
 /** 带进度、带超时（AbortController，不是 Promise.race，真能掐断请求）的二进制下载 */
 async function fetchBytes(url, { onProgress, timeout = 120000 } = {}) {
   const ctrl = new AbortController();
@@ -1179,9 +1278,9 @@ async function filesetFromBlob(mp, base, onProgress) {
   const jsTimeout = localBase ? 15000 : 30000;
   const binTimeout = localBase ? 25000 : 60000;
 
-  const jsBytes = await fetchBytes(paths.wasmLoaderPath, { timeout: jsTimeout });
+  const jsBytes = await downloadBytes(paths.wasmLoaderPath, { timeout: jsTimeout });
   onProgress?.(0.03);
-  const binBytes = await fetchBytes(paths.wasmBinaryPath, {
+  const binBytes = await downloadBytes(paths.wasmBinaryPath, {
     timeout: binTimeout,
     onProgress: (f) => onProgress?.(0.03 + f * 0.97),
   });
@@ -1356,32 +1455,11 @@ async function fetchModelBuffer() {
         buf = await loadModelViaScript(src.url);
       } else {
         setTrack(`下载模型（${src.label}）…`);
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 45000);
-        try {
-          const res = await fetch(src.url, { signal: ctrl.signal });
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          const total = +(res.headers.get('content-length') || 0);
-          const reader = res.body?.getReader?.();
-          if (!reader) {
-            buf = new Uint8Array(await res.arrayBuffer());
-          } else {
-            const chunks = [];
-            let got = 0;
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              chunks.push(value);
-              got += value.length;
-              setTrack(total ? `模型 ${Math.round((got / total) * 100)}%` : '下载模型…');
-            }
-            buf = new Uint8Array(got);
-            let o = 0;
-            for (const c of chunks) { buf.set(c, o); o += c.length; }
-          }
-        } finally {
-          clearTimeout(timer);
-        }
+        // fetch 被拦时自动改走 XHR —— 同一份数据，另一条系统调用路径
+        buf = await downloadBytes(src.url, {
+          timeout: 45000,
+          onProgress: (f) => setTrack(`模型 ${Math.round(f * 100)}%`),
+        });
       }
       if (!buf || buf.length < 100000) throw new Error('内容不完整（' + (buf?.length || 0) + ' 字节）');
       cachedModelBuffer = buf;
@@ -1401,7 +1479,7 @@ async function fetchModelBuffer() {
 }
 
 /**
- * ④ 建 landmarker：每档 wasm 基址走一遍「自己下载 → 建实例」，第一个成功就留用。
+ * ④ 建 landmarker：先按通道探测结果排好队，第一个成功的留用。
  * 只用 CPU delegate —— GPU delegate 在部分驱动上会**静默卡死**（不报错、不返回），
  * 而检测本身是每 45ms 一次，CPU 在 M 系列上 6~8ms/帧完全够。
  */
@@ -1412,10 +1490,42 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
     numFaces: 1,
   };
   const errs = [];
-  // 明确离线就别浪费三轮超时，直接走内置副本
   const offline = navigator.onLine === false;
-  const tryList = offline ? [] : bases;
-  if (offline) console.info('[track] navigator.onLine=false，跳过网络下载');
+  // 通道探测说 fetch / xhr 全死，那就别拿 4 次超时去撞南墙 —— 直接上内置副本
+  const netDead = lanes.fetch === false && lanes.xhr === false;
+  const tryList = offline || netDead ? [] : bases;
+  if (netDead) console.info('[track] fetch/xhr 都被拦，直接走内置副本');
+
+  const build = async (fileset, base, label) => {
+    onStatus?.('初始化模型…');
+    const lm = await withTimeout(
+      mp.FaceLandmarker.createFromOptions(fileset, opts),
+      90000,
+      '模型初始化超时',
+    );
+    return { lm, base, label };
+  };
+
+  const packLane = async () => {
+    onStatus?.('读取内置副本 3.7MB…');
+    return build(await loadWasmPack(), 'pack', '内置副本');
+  };
+  let packTried = false;
+  const tryPack = async () => {
+    if (packTried) return null;
+    packTried = true;
+    try { return await packLane(); } catch (e) {
+      errs.push('内置副本：' + wasmErrorText(e));
+      console.warn('[track] 内置副本失败', e?.message || e);
+      return null;
+    }
+  };
+
+  // 网络全死时把内置副本提到第一位（省掉 4 次注定失败的超时）
+  if (netDead && !offline) {
+    const ok = await tryPack();
+    if (ok) return ok;
+  }
 
   for (const base of tryList) {
     const local = base === 'wasm';
@@ -1428,46 +1538,57 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
         shown = pct;
         onStatus?.(`wasm ${pct}%`);
       });
-      onStatus?.('初始化模型…');
-      // 到这一步 wasm 已经在本地了，只剩编译 + 建图，60s 绰绰有余
-      const lm = await withTimeout(
-        mp.FaceLandmarker.createFromOptions(fileset, opts),
-        60000,
-        '模型初始化超时',
-      );
-      return { lm, base, label: local ? '本地副本' : 'CDN 兜底' };
+      return await build(fileset, base, local ? '本地副本' : 'CDN 兜底');
     } catch (e) {
       errs.push(`${local ? '本地 wasm' : 'CDN wasm'}：${wasmErrorText(e)}`);
       console.warn('[track] wasm 源失败', base, e?.message || e);
     }
   }
 
-  // fetch / XHR / import 全挂的环境（预览框、file://）：走不依赖网络型 fetch 的内置副本
-  onStatus?.('读取内置副本 3.7MB…');
-  try {
-    const fileset = await loadWasmPack();
-    onStatus?.('初始化模型…');
-    const lm = await withTimeout(
-      mp.FaceLandmarker.createFromOptions(fileset, opts),
-      90000,
-      '模型初始化超时',
-    );
-    return { lm, base: 'pack', label: '内置副本' };
-  } catch (e) {
-    errs.push('内置副本：' + wasmErrorText(e));
-    console.warn('[track] 内置副本失败', e?.message || e);
-  }
+  // 最后一道：不需要任何网络请求的通道（script 送字节 + blob 送文件）
+  const packed = await tryPack();
+  if (packed) return packed;
 
-  // 四个源很可能报同一句话，去重后再说，别让面板被重复文案撑爆
+  // 各源很可能报同一句话，去重后再说，别让面板被重复文案撑爆
   const uniq = [...new Set(errs.map((s) => s.replace(/^[^：]*：/, '')))];
   throw new Error('wasm 运行时加载失败（' + errs.length + ' 个来源都试过了：'
     + uniq.join('；') + '）'
-    + '〔环境：' + envDiagnostics() + '〕'
+    + '〔环境：' + envDiagnostics() + '，' + laneText() + '〕'
     + (location.origin === 'null'
       ? '。当前页面被预览框隔离了（origin=null），浏览器的网络请求通道被整体禁用，试试点面板里的「新窗口打开」'
       : isFileProtocol()
         ? '。当前是 file:// 打开，浏览器不允许读同目录文件，请改用 http(s) 或线上地址'
         : ''));
+}
+
+/** 追踪跑起来之后的统一收尾（两条路径共用） */
+function markTrackingOn() {
+  state.tracking = true;
+  state.live = false;
+  lastVideoTime = -1;
+  const btn = document.getElementById('btnTrack');
+  if (btn) { btn.disabled = false; btn.textContent = '重启追踪'; btn.classList.add('on'); }
+}
+
+/**
+ * MediaPipe 任何一环挂掉都走这里：不再死等，直接把"不用下载"的追踪器打开。
+ * 用户点一次按钮就该有反应 —— 报错不是交付物，能用的视差才是。
+ */
+function enableSimpleTracking(err) {
+  landmarker = null;
+  state.wasmBase = 'simple';
+  state.trackerMode = 'simple';
+  simpleTracker.start();
+  markTrackingOn();
+  setTrack('等待人头', 'ok');
+  const why = err ? (err?.message || String(err)) : '';
+  setTrackDetail(
+    '已切到免下载追踪（纯 JS 肤色追踪，不碰 wasm 与模型），可以直接用。'
+    + (why ? ' MediaPipe 未启用的原因：' + why : '')
+    + ' 想要更准的 478 点关键点，再点一次「重启追踪」或换 Chrome。',
+    false,
+  );
+  toast('已切到免下载追踪，把脸放进画面即可');
 }
 
 /** 启动 / 重启追踪：分阶段报状态，任何一步失败都说清原因 */
@@ -1480,80 +1601,90 @@ async function startTracking() {
   try {
     setTrackDetail('正在请求摄像头…');
     setTrack('取摄像头…');
+    // 通道探测和摄像头并行跑，不额外占时间；结果写进面板，下次故障一眼定位
+    const probing = probeLanes().catch(() => lanes);
     await openCamera();
-
     setTrackDetail('摄像头已就绪，加载 MediaPipe 运行时…');
     setTrack('加载运行时…');
-    const { mp, bases } = await loadRuntime();
+    await probing;
 
-    setTrackDetail('运行时已就绪，读取人脸模型…');
-    setTrack('下载模型…');
-    const buffer = await fetchModelBuffer();
+    try {
+      const { mp, bases } = await loadRuntime();
 
-    const { lm, base, label } = await createLandmarker(mp, bases, buffer, (t) => setTrack(t));
-    landmarker = lm;
-    state.wasmBase = base;
+      setTrackDetail('运行时已就绪，读取人脸模型…');
+      setTrack('下载模型…');
+      const buffer = await fetchModelBuffer();
 
-    state.tracking = true;
-    state.live = false;
-    lastVideoTime = -1;
-    setTrack('等待人脸', 'ok');
-    setTrackDetail(`追踪已启用（wasm 来自${label}）：脸进画面后按 C 校准中立位。`);
-    if (btn) { btn.disabled = false; btn.textContent = '重启追踪'; btn.classList.add('on'); }
-    toast('追踪已启用，把脸放进画面，按 C 校准');
+      const { lm, base, label } = await createLandmarker(mp, bases, buffer, (t) => setTrack(t));
+      landmarker = lm;
+      state.wasmBase = base;
+      state.trackerMode = 'mp';
+      simpleTracker.stop();
+      markTrackingOn();
+      setTrack('等待人脸', 'ok');
+      setTrackDetail(`追踪已启用（wasm 来自${label}）：脸进画面后按 C 校准中立位。`);
+      toast('追踪已启用，把脸放进画面，按 C 校准');
+    } catch (err) {
+      // wasm / 模型任一环断掉：降级，而不是把用户留在报错面板前
+      console.warn('[track] MediaPipe 不可用，改走免下载追踪', err);
+      enableSimpleTracking(err);
+    }
   } catch (err) {
+    // 能到这里的只剩摄像头本身失败
     console.warn('[track]', err);
     state.tracking = false;
     const msg = err?.message || String(err);
     const framed = (() => { try { return window.self !== window.top; } catch { return true; } })();
-    const modelIssue = /模型/.test(msg);
-    const wasmIssue = /wasm/i.test(msg);
     setTrack('未启用', 'bad');
-    setTrackDetail(
-      msg + (modelIssue || wasmIssue
-        ? '（点上面的按钮重试；也可以先用鼠标模拟头部）'
-        : ''),
-      true,
-    );
+    setTrackDetail(msg, true);
     // 被嵌在预览框里时，摄像头权限多半被 iframe 策略拦掉 → 引导去新窗口
     document.getElementById('btnOpen').classList.toggle('show', framed);
-    // 只有"模型读不到"才给选文件的入口；wasm 挂了选模型没用
-    document.getElementById('btnPickModel').classList.toggle('show', modelIssue);
     if (btn) { btn.disabled = false; btn.textContent = '重试追踪'; btn.classList.remove('on'); }
-    toast(wasmIssue
-      ? 'wasm 运行时没加载成功，点「重试追踪」再来一次'
-      : modelIssue ? '人脸模型没读到，可点面板里的「选择模型文件」手动载入' : msg);
-    // 摄像头通了但模型挂了：保留预览，让人知道摄像头本身是好的
+    toast(msg);
     if (!camStream) document.getElementById('camwrap').classList.add('hidden');
   } finally {
     starting = false;
   }
 }
 
-/** 每帧最多检测一次（不重复喂同一帧） */
+/** 每帧最多检测一次（不重复喂同一帧）。两种追踪器共用这个调度器。 */
 function pullCameraFrame() {
-  if (!landmarker || !video || video.readyState < 2) return;
+  if (!state.tracking || !video || video.readyState < 2) return;
   if (video.currentTime === lastVideoTime) return;
   const now = performance.now();
   if (now - lastDetectAt < detectInterval) return;
   lastVideoTime = video.currentTime;
   lastDetectAt = now;
 
-  let res;
-  try {
-    res = landmarker.detectForVideo(video, now);
-  } catch {
+  // ① MediaPipe：478 点关键点，有虹膜时最准
+  if (landmarker) {
+    let res;
+    try {
+      res = landmarker.detectForVideo(video, now);
+    } catch {
+      return;
+    }
+    // 推理越慢，检测频率越低，把主线程让给渲染（headless/CPU 代理时尤其明显）
+    const cost = performance.now() - now;
+    detectInterval = THREE.MathUtils.clamp(cost * 3, 40, 200);
+
+    const lm = res?.faceLandmarks?.[0];
+    if (!lm || lm.length < 400) { state.live = false; return; }
+    state.live = true;
+    ingestLandmarks(lm);
     return;
   }
 
-  // 推理越慢，检测频率越低，把主线程让给渲染（headless/CPU 代理时尤其明显）
-  const cost = performance.now() - now;
-  detectInterval = THREE.MathUtils.clamp(cost * 3, 40, 200);
-
-  const lm = res?.faceLandmarks?.[0];
-  if (!lm || lm.length < 400) { state.live = false; return; }
-  state.live = true;
-  ingestLandmarks(lm);
+  // ② 免下载色块追踪
+  if (simpleTracker.on) {
+    const t0 = performance.now();
+    const m = simpleTracker.step();
+    detectInterval = THREE.MathUtils.clamp((performance.now() - t0) * 5, 45, 160);
+    if (!m) { if (simpleTracker.lost) state.live = false; return; }
+    state.live = true;
+    // 色块宽度 → 瞳距同一量纲的像素值；绝对比例由校准时锁定，这里只保证"越近越大"
+    applyHeadMetrics(m.cx, m.cy, m.size * (video.videoWidth || 640) * 0.34);
+  }
 }
 
 /** 468/478 个关键点 → 眼睛在屏幕前的 (x, y, z) 米 */
@@ -1578,11 +1709,25 @@ function ingestLandmarks(lm) {
   }
 
   if (!Number.isFinite(ipdPx) || ipdPx < 3) return;
-  state.ipdPx = ipdPx;
-  if (!calib.ready) calibrate(cx, cy, ipdPx);
+  applyHeadMetrics(cx, cy, ipdPx);
+}
+
+/**
+ * 唯一的"头部量测 → 眼位"换算入口。
+ * 两种追踪器（MediaPipe 关键点 / 免下载肤色块）都只负责给出
+ *   cx, cy  头部中心在画面里的归一化坐标
+ *   sizePx  "瞳距"尺度的像素量（越大 = 越近）
+ * 后续针孔反解完全共用 —— 所以换追踪器不会改变视差手感。
+ */
+function applyHeadMetrics(cx, cy, sizePx) {
+  const vw = video.videoWidth || 640;
+  const vh = video.videoHeight || 480;
+
+  state.ipdPx = sizePx;
+  if (!calib.ready) calibrate(cx, cy, sizePx);
 
   // 针孔模型：瞳距在画面里越大 → 人越近（线性反比，比魔法常数稳得多）
-  const z = THREE.MathUtils.clamp(calib.z * calib.ipd / ipdPx, 0.25, 2.5);
+  const z = THREE.MathUtils.clamp(calib.z * calib.ipd / sizePx, 0.25, 2.5);
 
   // 同一角度偏移，离得越远对应的物理位移越大
   const kx = 2 * Math.tan(CAM_FOV_H / 2) * z; // 整幅画面宽度 ≈ 多少米
@@ -1607,9 +1752,135 @@ function calibrate(cx, cy, ipdPx) {
 
 function recalibrate() {
   calib.ready = false;
+  simpleTracker.reset();   // 顺手清掉色块追踪的先验，避免用旧位置当基准
   if (!state.live || !video) toast('已重置校准，检测到人脸后自动记录中立位');
   else toast('已按当前姿态重新校准（假定 60cm）');
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   免下载追踪器：零依赖、零网络、零模型
+   —— wasm 被拦 / 断网 / file:// 打开时，这条是唯一"绝不会因为加载而挂"的路
+
+   做法不是玄学：人的皮肤在 YCbCr 里是一个相当稳定的色块
+     Cr∈[133,178]  Cb∈[77,130]  Y>45  且 R 比 B 明显亮
+   在 160×120 的缩略图上取其连通域，按「面积 / 填充率 / 长宽比 /
+   离上一帧位置的距离 / 离画面中心的距离」打分，挑最像脸的那块。
+   中心与尺寸各做一次指数平滑，单帧跳变超过画面 12% 视为误检、只轻轻靠近。
+
+   精度不如 478 点关键点，但对"头平移 → 视差"这件事够用：
+   位置抖动被平滑吃掉，z 由色块面积换算（远近趋势是对的）。
+   ══════════════════════════════════════════════════════════════════ */
+const simpleTracker = (() => {
+  const W = 160, H = 120;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  const mask = new Uint8Array(W * H);
+  const seen = new Uint8Array(W * H);
+  const stack = new Int32Array(W * H);
+  let box = null;      // 平滑后的 {cx, cy, size}
+  let miss = 0;
+
+  /** 连通域 + 打分，返回最像脸的一块（归一化坐标） */
+  function bestBlob() {
+    seen.fill(0);
+    let best = null;
+    const minArea = W * H * 0.004;
+    for (let i0 = 0; i0 < W * H; i0++) {
+      if (!mask[i0] || seen[i0]) continue;
+      let sp = 0;
+      stack[sp++] = i0; seen[i0] = 1;
+      let area = 0, sx = 0, sy = 0;
+      let x0 = W, x1 = -1, y0 = H, y1 = -1;
+      while (sp) {
+        const p = stack[--sp];
+        const x = p % W;
+        const y = (p - x) / W;
+        area++; sx += x; sy += y;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = 1; stack[sp++] = p - 1; }
+        if (x < W - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = 1; stack[sp++] = p + 1; }
+        if (y > 0 && mask[p - W] && !seen[p - W]) { seen[p - W] = 1; stack[sp++] = p - W; }
+        if (y < H - 1 && mask[p + W] && !seen[p + W]) { seen[p + W] = 1; stack[sp++] = p + W; }
+      }
+      if (area < minArea) continue;
+      const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+      const fill = area / (bw * bh);
+      if (fill < 0.35) continue;                    // 细长条 / 花里胡哨的噪点
+      const aspect = bw / bh;
+      if (aspect < 0.45 || aspect > 2.2) continue;   // 脸+脖子大致在这个范围
+      const cx = sx / area / W;
+      const cy = sy / area / H;
+
+      let s = Math.min(1, area / (W * H * 0.07));    // 太小的块不太可能是脸
+      s += fill > 0.5 ? 1 : fill * 2;
+      s += aspect > 0.6 && aspect < 1.9 ? 0.7 : 0;
+      if (box) {
+        // 头一帧只挪几个像素：连续性是最强的先验，权重压过一切
+        const d = Math.hypot(cx - box.cx, (cy - box.cy) * (H / W));
+        s += 1.6 * Math.exp(-d / 0.10);
+      } else {
+        const d = Math.hypot(cx - 0.5, (cy - 0.5) * (H / W));
+        s += 1.0 * Math.exp(-d / 0.35);              // 第一次找脸：默认坐在画面中间
+      }
+      if (!best || s > best.score) {
+        best = { score: s, cx, cy, size: Math.sqrt(area) / W };
+      }
+    }
+    return best;
+  }
+
+  return {
+    on: false,
+    lost: true,
+    start() { this.on = true; this.lost = true; box = null; miss = 0; },
+    stop() { this.on = false; this.lost = true; box = null; },
+    reset() { box = null; miss = 0; },
+    /** 抓一帧算头部位置；画面里找不到脸就返回 null 并把 lost 置位。
+     *  src 可传任意可绘制的图源（测试用 canvas 也能喂） */
+    step(src) {
+      const v = src || video;
+      if (!v) return null;
+      if (v.readyState !== undefined && v.readyState < 2) return null;
+      const sw = v.videoWidth || v.width;
+      if (!sw) return null;
+      ctx.drawImage(v, 0, 0, W, H);
+      const d = ctx.getImageData(0, 0, W, H).data;
+      let skin = 0;
+      for (let p = 0, i = 0; p < W * H; p++, i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const y = 0.299 * r + 0.587 * g + 0.114 * b;
+        const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+        const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+        const hit = y > 45 && cb >= 77 && cb <= 130 && cr >= 133 && cr <= 178 && r > b + 8;
+        mask[p] = hit ? 1 : 0;
+        if (hit) skin++;
+      }
+      // 整幅几乎都是"肤色"（暖光房间 / 贴太近）：分不出前景，这帧作废
+      if (skin > W * H * 0.9) { miss++; if (miss > 6) this.lost = true; return null; }
+      const b0 = bestBlob();
+      if (!b0) {
+        miss++;
+        if (miss > 6) { this.lost = true; box = null; }
+        return null;
+      }
+      miss = 0;
+      this.lost = false;
+      if (!box) box = { cx: b0.cx, cy: b0.cy, size: b0.size };
+      else {
+        const jump = Math.hypot(b0.cx - box.cx, b0.cy - box.cy);
+        const k = jump > 0.12 ? 0.08 : 0.22;
+        box.cx += (b0.cx - box.cx) * k;
+        box.cy += (b0.cy - box.cy) * k;
+        box.size += (b0.size - box.size) * (jump > 0.12 ? 0.05 : 0.12);
+      }
+      return { cx: box.cx, cy: box.cy, size: box.size };
+    },
+  };
+})();
 
 /* ══════════════════════════════════════════════════════════════════
    相机：两种模式
@@ -1698,7 +1969,11 @@ function updateHud() {
   setText('hudZ', (eye.z * 100).toFixed(0) + ' cm');
   setText('hudBackend', state.backend);
   if (state.tracking) {
-    setTrack(state.live ? '人脸锁定' : '等待人脸', state.live ? 'ok' : '');
+    const simple = state.trackerMode === 'simple';
+    setTrack(
+      state.live ? (simple ? '色块锁定' : '人脸锁定') : (simple ? '找脸中' : '等待人脸'),
+      state.live ? 'ok' : '',
+    );
   }
 }
 
@@ -1803,6 +2078,22 @@ function bindUI() {
   document.getElementById('btnCal').addEventListener('click', recalibrate);
   document.getElementById('btnReset').addEventListener('click', resetAll);
   document.getElementById('btnTrack').addEventListener('click', () => startTracking());
+  /* 直接走免下载追踪：wasm 慢、被拦、不想等的时候一键到位 */
+  document.getElementById('btnSimple').addEventListener('click', async () => {
+    const el = document.getElementById('btnSimple');
+    if (el.disabled) return;
+    el.disabled = true;
+    try {
+      if (!camStream) await openCamera();
+      enableSimpleTracking(null);
+    } catch (err) {
+      setTrack('未启用', 'bad');
+      setTrackDetail(err?.message || String(err), true);
+      toast('摄像头没打开：' + (err?.message || err));
+    } finally {
+      el.disabled = false;
+    }
+  });
   document.getElementById('btnOpen').addEventListener('click', () => {
     window.open(location.href, '_blank', 'noopener');
   });
@@ -1990,6 +2281,8 @@ async function boot() {
     depthState, depthToZ, shapeDepthLayers,
     ingest: ingestLandmarks, loadSplat, startTracking, setTrack, setTrackDetail, setScene,
     setModel: (bytes) => { manualModelBuffer = bytes; },
+    lanes, probeLanes, laneText, simpleTracker, enableSimpleTracking,
+    loadRuntime, loadWasmPack, downloadBytes,
   };
 }
 

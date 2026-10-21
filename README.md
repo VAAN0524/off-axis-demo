@@ -265,6 +265,53 @@ python tools/pack_wasm.py    # wasm 9.0MB → gzip 2.7MB → base64 3.7MB 的普
 顺带一个附带收获：`file://` 打开现在也能跑（`import` 跨域 CDN 模块放行，wasm 走内置副本），不必再起本地服务。
 
 
+## 第四层：三条通道先探测，再决定怎么走
+
+Firefox + `http:` 的实例里连 5 个来源都报同一句 `NetworkError when attempting to fetch resource.` —— 这时候再往下堆源是白费力气，得先回答"这台环境的哪条通道是活的"。
+
+`fetch` / `XHR` / `<script src>` 是**三条互相独立**的通道：
+
+| 谁在拦 | fetch | XHR | `<script src>` | `import()` |
+| --- | --- | --- | --- | --- |
+| CSP `connect-src` | ✗ | ✗ | ✓ | ✓（`script-src`） |
+| 只改写了 `window.fetch` 的插件 | ✗ | ✓ | ✓ | ✓ |
+| `file://` / `sandbox` iframe | ✗ | ✗ | ✓ | ✗ |
+| 服务器把 9.4 MB 掐断 | ✗ | ✗ | — | — |
+
+所以页面在取摄像头的同时，用两个 2 字节的侦察文件（`wasm/ping.txt`、`wasm/ping.js`）各探一次，结论显示在面板的一行小字里：
+
+```
+通道 fetch 堵 · xhr 通 · script 通
+```
+
+判定刻意放宽 —— **只要拿到响应就算通**。404 说明网络好、文件不对；只有抛异常才是通道被锁。这个区别决定后面要不要白等 4 次 30 s 超时。
+
+- fetch 通：本地 `wasm/` → 国内镜像 → jsDelivr → unpkg（原顺序不动）
+- fetch 堵、XHR 通：同一批源自动改走 XHR（`downloadBytes` 里兜的），进度条照旧
+- 两条都堵：跳过所有网络源，直接读内置副本（省掉 4 次注定失败的超时）
+- 连内置副本都读不到：**不再停在一句报错上**，见下一节
+
+## 第五层：免下载追踪（纯 JS，不碰 wasm）
+
+wasm、模型、CDN 全部不可达时，页面自动切到一个 40 行就能讲完的追踪器，永远能起来：
+
+1. 摄像头画面缩到 160×120，按 YCbCr 取肤色（`Cr∈[133,178]`、`Cb∈[77,130]`、`Y>45`、`R>B+8`）
+2. 连通域标记，按「面积 / 填充率 / 长宽比 / 离上一帧的距离 / 离画面中心的距离」打分，挑最像脸的那块
+3. 中心与尺寸做指数平滑，单帧跳变超过画面 12% 视为误检，只轻推 8%
+
+它输出的 (cx, cy, size) 和 MediaPipe 的 (虹膜中心, 瞳距) 走同一个 `applyHeadMetrics()`，所以**换追踪器不会改变视差手感**（比例由校准时锁定，只有绝对基准不同）。精度不如 478 点，但「头平移 → 视差」这件事成立，且不会因为加载失败而消失。
+
+按钮也留了直通口：「免下载追踪（不依赖 wasm，立即可用）」。
+
+三条路径的实测（Chromium + fake camera，`Fetch.failRequest` 只掐 `Fetch`/`XHR` 两类资源，精确复刻 CSP 场景）：
+
+| 场景 | `state.trackerMode` | `state.wasmBase` | 结果 |
+| --- | --- | --- | --- |
+| 正常 | `mp` | `wasm`（本地） | 追踪启用 |
+| fetch + XHR 全堵 | `mp` | `pack`（内置副本） | 追踪启用 |
+| 再堵掉内置副本 | `simple` | `simple` | 追踪启用（降级但有得用） |
+
+
 ## 已知的坑
 
 - **3DGS 只能走 WebGPU**：`GaussianSplat` 的 NodeMaterial 来自 `three/webgpu`，WebGL 后端渲染不出来。页面会自动降级到 WebGL 并说明原因。
@@ -279,6 +326,8 @@ python tools/pack_wasm.py    # wasm 9.0MB → gzip 2.7MB → base64 3.7MB 的普
 - **`Aborted(both async and sync fetching of the wasm failed)` 不是模型问题**：是 9.4 MB 的 wasm 没下全，见上面「wasm 运行时」一节。同理，`-sASSERTIONS` 只会让错误更啰嗦，不会让它能跑。
 - **同一页只能有一份 MediaPipe runtime**：同时引入 legacy `@mediapipe/pose` 和新版 `tasks-vision` 会撞出两个 emscripten 实例，症状同样是各种 `Aborted`（官方 issue #5495）。
 - **`NetworkError when attempting to fetch resource.` 不是源坏了**：连本地相对路径都失败时，是这个环境把 fetch 通道整体掐了（`file://`、`sandbox` iframe 都这样）。此时 `import` 同源、`XHR` 也一起失败，但 classic `<script>` 和 `fetch(blob:)` 还通 —— 见上面「第三层」一节。
+- **别再靠"多加几个 CDN"解决 `NetworkError`**：五个源报同一句话时，问题在通道不在源。先看面板那行 `通道 fetch / xhr / script`，再去决定走哪条路。
+- **降级要用户看得见**：面板会写清「已切到免下载追踪 + MediaPipe 未启用的原因」，而不是把一段红色报错丢给用户。追踪本身不该因为 wasm 加载失败而不可用。
 - **GPU delegate 会静默卡死**：`baseOptions.delegate: 'GPU'` 在部分驱动上既不返回也不报错。检测本身是每 45 ms 一次，CPU 在 M 系列上 6–8 ms/帧完全够，所以只用 CPU。
 
 ## 素材
