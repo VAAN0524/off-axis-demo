@@ -13,3 +13,7 @@ _frame_test.html
 # 深度模型（约 27MB，只在离线烘焙时用）
 model/
 img/*.bin
+img/*_depth.png
+
+# 烘焙中间产物（out_ldi 是旧管线留下的，已并入 ldi/）
+out_ldi/

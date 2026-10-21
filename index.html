@@ -293,7 +293,10 @@ const params = {
   showTest: true,
   scene: 'depth',      // 'depth' 深度网格 ｜ 'cards' 分层贴片（对比）
   depthStrength: 1.0,  // 深度强度：压缩或夸张前后距离
-  cull: new URLSearchParams(location.search).get('cull') !== '0', // 剪影外三角面剔除
+  // 剪影外三角面剔除。默认关：网格加密到 2px 之后，靠 alpha 切边已经足够干净，
+  // 而剔除会让边缘退回网格台阶（一格 2px 的锯齿仍然看得见）。
+  // 想对比可以加 ?cull=1。
+  cull: new URLSearchParams(location.search).get('cull') === '1',
   foreOpaque: 1.0,     // 贴片不透明度（1 = 实心，越低越透）
 };
 
@@ -612,36 +615,63 @@ const DEPTH_SCENE = {
   zNear: 0.40,  // 最近像素落在屏幕后 40cm
   zFar: 3.20,   // 最远像素
   margin: 0.45, // 裙边：向外各扩 45% 半屏宽，头动时补边
-  segX: 240,
-  segY: 150,
+  segX: 480,    // 网格密度。240 时一格 4px，剪影处 alpha 只有 4px 台阶 → 毛边；
+  segY: 300,    // 480 时一格 2px，软边能吃满，边缘才干净
   pad: 0.20,    // 贴图四周多铺一圈延伸图，画面边缘不会拉出亮线
 };
 
 /**
- * 只有两层：一张满幅的背景板 + 一个按剪影抠出来的近景。
- * 为什么不是一张连续网格：连续网格上「笔电 0.5m → 墙 3m」那条深度断层
- * 会被三角面拉成一张橡皮布，头一偏就液化。切开以后每层内部的深度只在自己
- * 那一段里变（近景 0.40–0.66m、远景 0.66–3.2m），跨轮廓的拉伸就没了。
+ * 两层 LDI（tools/bake_ldi.py 烘出来的）：
+ *   背景板：满幅、无 alpha，遮挡区已被 LaMa 擦成墙/桌子的延续；
+ *   近景层：语义物体 + 深度近景片，带 1~2px 软 alpha。
  *
- * 远景板是离线补过的（depth/near_plate.jpg 把近景挡住的区域填掉了），
- * 所以它不含笔电轮廓；近景挪开时露出来的也是像样的虚焦像素，不是黑洞。
+ * 深度不再分段钳制（上一版近景 0.55~1.0、远景 0~0.55）：现在每层内部都没有
+ * 跨轮廓断层（洞已经填连续了），所以两层都可以直接用完整 0~1 的深度，
+ * 桌面这种"比墙近、比笔电远"的斜面才会挂在正确的深度上。
  */
 const DEPTH_LAYERS = [
   {
-    label: '远景', d0: 0.00, d1: 0.55, order: 0,
-    tex: 'depth/near_plate.jpg', texRemote: null,
-    depthKind: 'png', depthSrc: 'depth/near_plate_depth.png',
+    label: '背景', d0: 0, d1: 1, order: 0,
+    tex: 'ldi/bg.jpg', texRemote: null,
+    depthKind: 'png', depthSrc: 'ldi/bg_depth.png',
     mask: null,
   },
   {
-    label: '近景', d0: 0.55, d1: 1.00, order: 2,
-    tex: 'photo', texRemote: null,
-    // 这份深度是离线补过边的：近景区间内的值一直延伸到剪影之外，
-    // 所以剪影处没有落差 → 不会出现"橡皮斜坡"，alpha 能干净地切开
-    depthKind: 'png', depthSrc: 'depth/near_layer_depth.png',
-    mask: 'depth/near_mask_near.png',
+    label: '近景', d0: 0, d1: 1, order: 2,
+    tex: 'ldi/fg.jpg', texRemote: null,
+    depthKind: 'png', depthSrc: 'ldi/fg_depth.png',
+    mask: 'ldi/fg_alpha.png',
   },
 ];
+
+/**
+ * ?ldi=<目录>&photo=<图片> 覆盖烘焙产物路径。
+ * 换一张照片不必改代码：先 tools/build_ldi.sh 出到任意目录，
+ * 再用 index.html?ldi=/tmp/ldi_mid 预览。目录里的文件名是固定的那五个。
+ */
+(function applyQueryOverride() {
+  const q = new URLSearchParams(location.search);
+  const dir = q.get('ldi');
+  if (dir) {
+    const base = dir.replace(/\/+$/, '');
+    for (const L of DEPTH_LAYERS) {
+      for (const k of ['tex', 'depthSrc', 'mask']) {
+        if (L[k]) L[k] = `${base}/${L[k].split('/').pop()}`;
+      }
+    }
+  }
+  const photo = q.get('photo');
+  if (photo) {
+    DEPTH_SCENE.photo = photo;
+    DEPTH_SCENE.photoRemote = null;
+  }
+})();
+
+/**
+ * 为什么不是一张连续网格：连续网格上「笔电 0.5m → 墙 3m」那条深度断层
+ * 会被三角面拉成一张橡皮布，头一偏就液化。切成两层以后，每层内部都没有
+ * 跨轮廓的断层（背景层的洞已经填成连续的了），拉伸就没了。
+ */
 
 const depthState = {
   group: null,
@@ -2228,12 +2258,13 @@ function bindUI() {
   });
 
   /* 无摄像头时的降级输入：鼠标 / 滚轮
-     鼠标只映射到 ±14cm 左右，别让人一下把眼位拖到屏幕边缘 ——
-     单目深度看不到被遮挡的像素，眼位离得太远就必然要补洞。 */
+     鼠标只映射到 ±7.5cm 左右。单目深度看不到被遮挡的像素，眼位离得太远
+     就必然要露出大面积没拍到的东西 —— 那一块怎么补都会是"平"的。
+     ±7.5cm 已经能明显感觉到透视变化，而补洞量控制在一圈窄带里。 */
   addEventListener('pointermove', (e) => {
     if (state.live) return;
-    target.x = (e.clientX / innerWidth - 0.5) * screen.w * 0.5;
-    target.y = -(e.clientY / innerHeight - 0.5) * screen.h * 0.5;
+    target.x = (e.clientX / innerWidth - 0.5) * screen.w * 0.21;
+    target.y = -(e.clientY / innerHeight - 0.5) * screen.h * 0.21;
     target.z = state.pointerZ;
   }, { passive: true });
 

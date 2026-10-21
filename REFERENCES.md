@@ -177,7 +177,81 @@ three r186 的 `GaussianSplat` 有个硬限制：NodeMaterial 来自 `three/webg
 - `#5380` / `#5512` 一类 issue 里反复出现 `NetworkError when attempting to fetch resource.`，回复基本都是「路径不对 / 服务器没给 `application/wasm`」。但我们实测到第三种成因：**环境把 fetch 通道整体禁掉**（`file://`、sandbox iframe），此时报错和路径、MIME 全都无关 —— 判别方法是看同源相对路径是否也挂
 - 打包器侧的同类思路：Vite 的 `assetsInlineLimit` / `?inline`、webpack 的 `asset/inline` 都是把二进制变 base64 塞进 JS，绕开独立请求。`emscripten` 自己也支持 `-sSINGLE_FILE=1` 生成「wasm 内嵌」的单文件 —— 官方给的正是这条路
 
-## 七、已经落地 / 还没做
+## 七、分层与补洞：这一轮真正动手用上的方案
+
+前面第四节是「同类项目怎么切层」，这一节是**毛边 / 背景空白**这两个具体问题的出处。
+
+### 1. vt-vl-lab/3d-photo-inpainting（CVPR 2020）—— LDI 的原始定义
+
+- https://github.com/vt-vl-lab/3d-photo-inpainting
+
+它定义了 LDI 这个表示本身：近景 LDI + 满幅背景 LDI，被挡住的像素靠 context-aware inpainting 造出来。我们这套结构（剪影近景 + 满幅背景）与它同构，三处直接借了它的思路：
+
+- **深度边缘修复**：单目深度边缘是糊的，它靠反复的 bilateral median / cumulative minimum 把阶跃收到几像素。我们换成三级引导滤波（r=20/10/5，eps 递减，各 2 次迭代 + `median_filter(3)`），目的相同，但对 960×600 只要几十毫秒。
+- **先外扩再修**：它修遮挡区之前会先把边缘像素摊进去，否则补出来的内容和边界对不上。我们换成「颜色向 alpha 外扩散（push-pull）+ 软边去色」——注意这一步必须在补洞**之前**做，否则 LaMa 拿到的是被污染的边缘。
+- **露出带 = 视差位移量**：`shift ≈ e·zRef/(halfW) · (1/z_fg − 1/z_bg)`。把眼位上限代入，就知道最多只会露几十像素，不必修整块前景。
+
+它没解决的是细杆和头发 —— 硬深度分层表达不了薄结构，这正是下一篇的动机。
+
+### 2. SLIDE（ICCV 2021）—— 软分层才是薄结构的正解
+
+- 论文：*SLIDE: Single Image 3D Photography with Soft Layering and Depth-aware Inpainting*
+- 社区复现：`macvincent/Single-Image-3D-Photography`
+
+论文对 3D-Photo 那类模块化系统的批评非常直接：**硬深度分层无法表达头发、树叶、栏杆这类薄结构**。它的解法是给每个像素一个 alpha，层与层之间软混合，并且 inpainting 训练时就带深度先验（depth-aware），让补出来的背景知道自己该在哪个深度上。
+
+我们现在的对应物只是它的廉价近似：
+
+```python
+alpha = np.maximum(soft_alpha(fg, lum), a_obj)     # 距离场软边 1.6px + 语义软边取大
+alpha = guided(lum, alpha, r=2, eps=4e-3)          # 吸附到原图轮廓
+```
+
+够用（笔电、桌面、柱子这类实心物体），但**不等于软分层**：真做法要给每个像素一整套 (color, depth, alpha) 并逐像素合成，渲染侧的工作量完全是另一个量级。这也是我们认为「薄结构」还留在待办里的原因 —— 不是调参能解决的。
+
+### 3. 抠图模型：u2netp 只是起点
+
+| 模型 | 体积 | 定位 | 我们怎么用 |
+| --- | --- | --- | --- |
+| `u2netp` | 4.3 MB | 通用显著物体，320×320 | 现在用的。只抠"看得见的主体"，桌面这类支撑面它不管 —— 所以还要深度片补 |
+| BiRefNet / RMBG-2.0 | ONNX int8 约 350 MB | 发丝级、能出半透明边 | 离线烘焙可以换，前端别想 |
+| MODNet | ~25 MB | 人像实时 / 视频 | 人像场景专用，比 u2netp 干净 |
+| SAM 2 | 数百 MB | 实例分割，要 prompt | parallax-maker 那条路（按实例切卡片） |
+
+结论没变，但更清楚了：**深度片（支撑面）+ 深度断层（边界）+ 语义分割（谁是物体）三路互补**，换更强的抠图只提升其中一路。风景照里这一路本来就应该关掉 —— 见 README 里的语义守卫。
+
+### 4. 浏览器里算深度：已经不需要服务器
+
+| 项目 | 做法 |
+| --- | --- |
+| https://github.com/Xenova/webgpu-realtime-depth-estimation | Transformers.js + WebGPU，摄像头/图片流式出深度图 |
+| https://github.com/sabicalija/relief | Vue3 + TresJS，Depth Anything V2 **Small（约 25 MB）直接在浏览器里跑**，GitHub Pages 部署，已实测可用 |
+| https://github.com/activeguild/render-image-depth | transformers.js + 按深度切 2–20 层平面 |
+
+也就是说「用户拖一张图进来就出效果」在技术上已经通了：深度 1–3s，抠图几百毫秒。**卡的不是深度，是补洞** —— LaMa 198 MB，前端跑不动；轻量替代方案（512 输入的快速修复模型）质量会掉一档。
+
+### 5. 所以「任意一张照片」的三条路
+
+| 路径 | 首屏成本 | 单张耗时 | 质量 | 判断 |
+| --- | --- | --- | --- | --- |
+| 离线烘焙（现在） | 0 | 13–30 s（M 系列，含两次 LaMa） | 最好 | 适合固定素材 / 发布 |
+| 本地服务（下一步） | 0 | 同上，拖图即出 | 最好 | 照片丢给 `build_ldi.sh`，前端 `?ldi=` 直接看；一条 HTTP 接口就够 |
+| 纯前端 | 约 30 MB 模型（深度 25 + 抠图 4.3） | 2–5 s + 补洞 | 中（没有 LaMa，只能方向插值 / 平滑外推） | 可行，但要接受细杆处发糊 |
+
+短期最划算的是第二条：前端一行 `?ldi=` 已经能指向任意目录，缺的只是一个把「上传 → 烘焙 → 回 JSON」串起来的服务端点。
+
+## 八、这一轮踩的坑（补洞部分，都是实测）
+
+1. **两侧插值填露出带 → 长出「梳齿」**。`directional_fill` 按行/列就近插值，但露出带紧贴物体，插值时会把物体边缘的颜色一圈圈拉进洞里。白柱子左边直接长出 48px 宽的梳齿，比原来的双影还显眼。
+2. **露出带用外接矩形送 LaMa → 把背景擦成浆糊**。环状 mask 的 bbox 常常覆盖半个画面（笔电场景把背后那把椅子、杯子一起抹了）。细环必须原样送进去，LaMa 本来就擅长窄洞。
+3. **LaMa 直接 `resize(512,512)`** → 960×600 被压成正方形，砖块被压扁，模型按变形纹理生成，砖缝方向全错。必须等比缩放 + 居中补边。
+4. **紧贴轮廓的 mask** → 模型让洞内与边界一致的最省事办法就是再画一个物体（笔电「躺平」在原地）。外接矩形才治得住。
+5. **LaMa 补完整体偏亮/偏冷** → 墙有自上而下的明暗渐变，它在洞里没有这个概念。低频对齐：只校正边界那点差，再 push-pull 渗进洞里。
+6. **背景层把支撑面也填了** → 同一块桌面在两层里深度不同，眼一动就错开、露出背景填的纯色。支撑面必须保留原像素 + 原深度。
+7. **风景照把桥当主体** → u2netp 的显著性是"画面里最大最集中的东西"，不是"离镜头最近的物体"。语义守卫：面积 > 30% / bbox > 55% / 宽 > 85% / 高 > 90% 直接弃用语义。
+8. **onnxruntime 退出时自杀**：`recursive_mutex lock failed: Invalid argument`，图早写完了但退出码变 1，`set -e` 的脚本会被打断。末尾 `os._exit(0)` 跳过析构即可。
+
+## 九、已经落地 / 还没做
 
 **已落地**
 
@@ -207,8 +281,15 @@ three r186 的 `GaussianSplat` 有个硬限制：NodeMaterial 来自 `three/webg
 | GitHub Pages | 6.0 s（wasm 走 Pages 同源，gzip 到 2.9MB） |
 | 改之前（直连 CDN） | 28.4 s（本地档 20s 超时被打断，被迫换源） |
 
+4. **LDI 烘焙管线**（`tools/build_ldi.py` + `build_ldi.sh`，一条命令出六个文件）。毛边从「8px 模糊边 + 4px 网格台阶」收到「1.6px 距离场 + 引导吸附 + 2px 网格」；背景空白从「35% 的洞靠均值填」改成「只修露出带，物体用 LaMa、支撑面不动」。离线残影指标：笔电 10.6%、船景 2.7%（`tools/verify_ldi.py`）。
+5. **语义守卫 + 自动降级**：u2netp 只抠显著物体，风景照里会把桥当主体。面积 / bbox / 长宽比超限就弃用语义，退回纯深度片；LaMa 缺失时退回插值与平滑外推。
+6. **`?ldi=` / `?photo=` 查询参数**：换一张照片不必改代码，烘焙到任意目录指过去即可。
+
 **还没做**
 
-4. **3DGS 换 Spark**：`GaussianSplat` 在无 WebGPU 的机器上完全不可用；Spark 覆盖 WebGL2，且原生支持多视角，与离轴更搭。
-5. **物理校准向导**（抄 off-axis-sneaker / pokebox）：让用户填屏幕对角线、观看距离、眼高并存 `localStorage`，现在靠滑杆推算是"够用但不准"。
-6. **换 SAM 切层**（抄 parallax-maker）：把深度阈值换成语义分割，专治"笔电 vs 白墙"这类边界。
+7. **3DGS 换 Spark**：`GaussianSplat` 在无 WebGPU 的机器上完全不可用；Spark 覆盖 WebGL2，且原生支持多视角，与离轴更搭。
+8. **物理校准向导**（抄 off-axis-sneaker / pokebox）：让用户填屏幕对角线、观看距离、眼高并存 `localStorage`，现在靠滑杆推算是"够用但不准"。
+9. **SAM 切层**（抄 parallax-maker）：把深度阈值换成语义分割，专治"笔电 vs 白墙"这类边界。
+10. **软分层（抄 SLIDE）**：现在 alpha 只做 1.6px 软边，细杆/头发/树叶还是跟着深度片轮廓走。真做法要逐像素 (color, depth, alpha) 三元组 + 软合成，属于渲染侧重构。
+11. **上传即出**（本地服务或纯前端）：`?ldi=` 已经把前端接口留好了，缺的是「上传 → 烘焙 → 回目录」的服务端点。纯前端路线要解决 LaMa 的 198MB。
+

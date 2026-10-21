@@ -1,0 +1,11 @@
+{
+  "cut": 0.391,
+  "band_px": 37,
+  "fg_ratio": 0.3852,
+  "obj_ratio": 0.1986,
+  "disocc_ratio": 0.1405,
+  "size": [
+    960,
+    600
+  ]
+}
