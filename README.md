@@ -137,7 +137,7 @@ pathlib.Path('models/face_landmarker.b64.js').write_text(
 PY
 ```
 
-追踪初始化分四段，每段独立超时：摄像头 12s → 运行时脚本 15s → 模型 45s（带百分比）→ wasm 下载 30/120s（带百分比）→ 建图 60s。
+追踪初始化分四段，每段独立超时：摄像头 12s → 运行时脚本 15s → 模型 45s（带百分比）→ wasm 下载 15/25s（同源）、30/60s（跨源），带百分比 → 建图 60s → 全败后读内置副本。
 
 实测（`--use-fake-device-for-media-stream`）：
 
@@ -146,6 +146,8 @@ PY
 | 本地 http（首次） | 493 ms | 本地副本 |
 | GitHub Pages（首次） | 6.0 s | Pages 同源，`Content-Encoding: gzip` 压到 2.9 MB |
 | 改之前（直连 CDN） | 28.4 s | jsDelivr，本地档 20 s 超时被打断后被迫换源 |
+| fetch 全线失败（模拟受限环境） | 2.6 s | 内置副本 `wasm/vision_wasm_pack.js` |
+| `file://` 直接打开 | 2.8 s | CDN 兜底（跨源 `import` 放行） |
 
 ## wasm 运行时：为什么必须放进仓库
 
@@ -204,6 +206,7 @@ const fileset = {
 | `vision_wasm_internal.js` | 210 KB | emscripten glue |
 | `vision_wasm_internal.wasm` | 9.4 MB | 真正的算力 |
 | `vision_wasm_nosimd_internal.js` | 210 KB | 非 SIMD 浏览器的 glue（wasm 走 CDN 兜底） |
+| `vision_wasm_pack.js` | 3.7 MB | gzip+base64 副本，fetch 被禁时的最后一道（`tools/pack_wasm.py` 生成） |
 
 非 SIMD 浏览器的 9.3 MB `vision_wasm_nosimd_internal.wasm` 没有入库：现代浏览器（Chrome 91+ / Safari 16.4+ / Firefox 89+）都支持 SIMD，真遇上老浏览器会 404，然后自动落到 CDN 那一档。
 
@@ -215,6 +218,40 @@ node -e 'const fs=require("fs"); WebAssembly.compile(fs.readFileSync("wasm/visio
 ```
 
 顺带一个反直觉的结论：**换版本救不了这个体积**。1.1.1 的 wasm 约 12 MB，0.10.14 是 9.4 MB，都是 9 MB 量级。
+
+## 第三层：fetch 被整体禁用时（`NetworkError`）
+
+现象：三个源全部报
+
+```
+wasm 运行时加载失败（本地 wasm：NetworkError when attempting to fetch resource.；
+CDN wasm：NetworkError when attempting to fetch resource.；…）
+```
+
+`NetworkError when attempting to fetch resource.` 是 WebKit / Firefox 的措辞（Chrome 写 `Failed to fetch`）。**连同源相对路径都失败**，说明不是源的问题，是这台环境把 fetch 通道整体掐了。
+
+实测两种受限环境（`file://` 打开、`sandbox` iframe 预览框，两者 `location.origin` 都是 `"null"`）：
+
+| 通道 | 结果 |
+| --- | --- |
+| `fetch()` 同源 / 跨源 | ✗ NetworkError |
+| `XMLHttpRequest` 同源 | ✗ |
+| `import()` 同源模块 | ✗ |
+| **classic `<script src>`** | ✓ |
+| **`fetch(blob:…)`** | ✓ |
+| **`DecompressionStream`** | ✓ |
+
+所以兜底只要用「script 送字节 + blob 送文件」这一条：
+
+```bash
+python tools/pack_wasm.py    # wasm 9.0MB → gzip 2.7MB → base64 3.7MB 的普通脚本
+```
+
+页面在 fetch 三源全败（或 `navigator.onLine === false`）后，注入 `wasm/vision_wasm_pack.js`，把 base64 解码、`gunzip` 还原、转 `blob:` URL 交给 MediaPipe —— 全程不碰网络型 fetch。
+
+验证：把 `window.fetch` 对 `*.wasm` 全部改成抛 `TypeError('NetworkError…')`，点击后 **2.6 s** 到「等待人脸」，`state.wasmBase === 'pack'`。
+
+顺带一个附带收获：`file://` 打开现在也能跑（`import` 跨域 CDN 模块放行，wasm 走内置副本），不必再起本地服务。
 
 
 ## 已知的坑
@@ -230,6 +267,7 @@ node -e 'const fs=require("fs"); WebAssembly.compile(fs.readFileSync("wasm/visio
 - **鼠标映射别给太大**：`±14 cm` 足够看出视差；映射到半屏时眼位会跑到屏幕边缘，单目深度根本补不出那块被挡住的像素。
 - **`Aborted(both async and sync fetching of the wasm failed)` 不是模型问题**：是 9.4 MB 的 wasm 没下全，见上面「wasm 运行时」一节。同理，`-sASSERTIONS` 只会让错误更啰嗦，不会让它能跑。
 - **同一页只能有一份 MediaPipe runtime**：同时引入 legacy `@mediapipe/pose` 和新版 `tasks-vision` 会撞出两个 emscripten 实例，症状同样是各种 `Aborted`（官方 issue #5495）。
+- **`NetworkError when attempting to fetch resource.` 不是源坏了**：连本地相对路径都失败时，是这个环境把 fetch 通道整体掐了（`file://`、`sandbox` iframe 都这样）。此时 `import` 同源、`XHR` 也一起失败，但 classic `<script>` 和 `fetch(blob:)` 还通 —— 见上面「第三层」一节。
 - **GPU delegate 会静默卡死**：`baseOptions.delegate: 'GPU'` 在部分驱动上既不返回也不报错。检测本身是每 45 ms 一次，CPU 在 M 系列上 6–8 ms/帧完全够，所以只用 CPU。
 
 ## 素材

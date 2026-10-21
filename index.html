@@ -1163,11 +1163,16 @@ async function filesetFromBlob(mp, base, onProgress) {
 
   // 让官方实现去判断该用 SIMD 版还是 nosimd 版，我们只接管"谁来下载"
   const paths = await mp.FilesetResolver.forVisionTasks(base);
+  const localBase = !/^https?:/i.test(base);
 
-  const jsBytes = await fetchBytes(paths.wasmLoaderPath, { timeout: 30000 });
+  // 同源失败是秒挂（CORS / 断网），不用给长预算；跨域要留够真实下载时间
+  const jsTimeout = localBase ? 15000 : 30000;
+  const binTimeout = localBase ? 25000 : 60000;
+
+  const jsBytes = await fetchBytes(paths.wasmLoaderPath, { timeout: jsTimeout });
   onProgress?.(0.03);
   const binBytes = await fetchBytes(paths.wasmBinaryPath, {
-    timeout: 120000,
+    timeout: binTimeout,
     onProgress: (f) => onProgress?.(0.03 + f * 0.97),
   });
 
@@ -1183,6 +1188,84 @@ async function filesetFromBlob(mp, base, onProgress) {
   };
   wasmFilesetCache.set(base, fileset);
   return fileset;
+}
+
+/** gzip 解压（用浏览器原生的 DecompressionStream，不引第三方库） */
+async function gunzip(bytes) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('此浏览器不支持 DecompressionStream（需要 Chrome 80+ / Safari 16.4+ / Firefox 113+）');
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * 最后一道兜底：wasm 走「普通脚本 + blob」，完全不碰网络型 fetch。
+ *
+ * 这条路径不是拍脑袋加的。实测两种受限环境（file:// 打开、sandbox iframe
+ * 预览框，两者 origin 都是 null）：
+ *   fetch 同源     ✗ NetworkError / Failed to fetch
+ *   XMLHttpRequest ✗ 同上
+ *   import 同源    ✗ 同上
+ *   classic script ✓
+ *   fetch(blob:)   ✓
+ *   DecompressionStream ✓
+ * 所以在 fetch / XHR / import 全线被拒的环境里，只有「script 送字节 +
+ * blob 送文件」这一条能走通。tools/pack_wasm.py 把 9.4MB 的 wasm 压成
+ * gzip+base64 的普通脚本（3.7MB），这里解码后还原成 blob: URL。
+ */
+let wasmPackPromise = null;
+function loadWasmPack() {
+  if (wasmPackPromise) return wasmPackPromise;
+  wasmPackPromise = (async () => {
+    if (!window.__MP_WASM_PACK) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        const timer = setTimeout(() => reject(new Error('读取超时')), 120000);
+        s.onload = () => { clearTimeout(timer); resolve(); };
+        s.onerror = () => { clearTimeout(timer); reject(new Error('文件不存在或被浏览器拦截')); };
+        s.src = 'wasm/vision_wasm_pack.js';
+        document.head.appendChild(s);
+      });
+    }
+    const pack = window.__MP_WASM_PACK;
+    if (!pack) throw new Error('副本里没有数据（文件被截断？）');
+    window.__MP_WASM_PACK = null; // 3.7MB 的字符串用完立刻放掉
+
+    const [loaderBytes, binBytes] = await Promise.all([
+      gunzip(b64ToBytes(pack.js)),
+      gunzip(b64ToBytes(pack.wasm)),
+    ]);
+    if (!(binBytes[0] === 0x00 && binBytes[1] === 0x61 && binBytes[2] === 0x73 && binBytes[3] === 0x6d)) {
+      throw new Error('副本里的 wasm 不完整（' + binBytes.length + ' 字节）');
+    }
+    return {
+      wasmLoaderPath: URL.createObjectURL(new Blob([loaderBytes], { type: 'text/javascript' })),
+      wasmBinaryPath: URL.createObjectURL(new Blob([binBytes], { type: 'application/wasm' })),
+    };
+  })().catch((e) => { wasmPackPromise = null; throw e; });
+  return wasmPackPromise;
+}
+
+/**
+ * fetch 全军覆没时，光说「NetworkError」帮不上忙。
+ * 把能一眼定位环境的东西带上：协议、origin（null = 被 sandbox 隔离）、
+ * 是否在 iframe 里、什么浏览器。
+ */
+function envDiagnostics() {
+  const ua = navigator.userAgent || '';
+  const browser = /Firefox\//.test(ua) ? 'Firefox'
+    : /Edg\//.test(ua) ? 'Edge'
+    : /OPR\//.test(ua) ? 'Opera'
+    : /Chrome\//.test(ua) ? 'Chrome'
+    : /Safari\//.test(ua) ? 'Safari' : '未知浏览器';
+  let framed = false;
+  try { framed = window.self !== window.top; } catch { framed = true; }
+  const sandboxed = location.origin === 'null';
+  const parts = [location.protocol || '?', browser];
+  if (sandboxed) parts.push('被 sandbox 隔离（origin=null）');
+  else if (framed) parts.push('在 iframe 里');
+  return parts.join(' / ');
 }
 
 /** ② MediaPipe 运行时：bundle 两源；wasm 只把可用基址列出来，下载留给 ④ 做 */
@@ -1319,7 +1402,12 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
     numFaces: 1,
   };
   const errs = [];
-  for (const base of bases) {
+  // 明确离线就别浪费三轮超时，直接走内置副本
+  const offline = navigator.onLine === false;
+  const tryList = offline ? [] : bases;
+  if (offline) console.info('[track] navigator.onLine=false，跳过网络下载');
+
+  for (const base of tryList) {
     const local = base === 'wasm';
     let shown = -1;
     try {
@@ -1337,14 +1425,36 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
         60000,
         '模型初始化超时',
       );
-      return { lm, base };
+      return { lm, base, label: local ? '本地副本' : 'CDN 兜底' };
     } catch (e) {
       errs.push(`${local ? '本地 wasm' : 'CDN wasm'}：${wasmErrorText(e)}`);
       console.warn('[track] wasm 源失败', base, e?.message || e);
     }
   }
+
+  // fetch / XHR / import 全挂的环境（预览框、file://）：走不依赖网络型 fetch 的内置副本
+  onStatus?.('读取内置副本 3.7MB…');
+  try {
+    const fileset = await loadWasmPack();
+    onStatus?.('初始化模型…');
+    const lm = await withTimeout(
+      mp.FaceLandmarker.createFromOptions(fileset, opts),
+      90000,
+      '模型初始化超时',
+    );
+    return { lm, base: 'pack', label: '内置副本' };
+  } catch (e) {
+    errs.push('内置副本：' + wasmErrorText(e));
+    console.warn('[track] 内置副本失败', e?.message || e);
+  }
+
   throw new Error('wasm 运行时加载失败（' + errs.join('；') + '）'
-    + (isFileProtocol() ? '。当前是 file:// 打开，浏览器不允许读同目录的 wasm，请改用 http(s) 或线上地址。' : ''));
+    + '〔环境：' + envDiagnostics() + '〕'
+    + (location.origin === 'null'
+      ? '。当前页面被预览框隔离了（origin=null），浏览器的网络请求通道被整体禁用，试试点面板里的「新窗口打开」'
+      : isFileProtocol()
+        ? '。当前是 file:// 打开，浏览器不允许读同目录文件，请改用 http(s) 或线上地址'
+        : ''));
 }
 
 /** 启动 / 重启追踪：分阶段报状态，任何一步失败都说清原因 */
@@ -1367,7 +1477,7 @@ async function startTracking() {
     setTrack('下载模型…');
     const buffer = await fetchModelBuffer();
 
-    const { lm, base } = await createLandmarker(mp, bases, buffer, (t) => setTrack(t));
+    const { lm, base, label } = await createLandmarker(mp, bases, buffer, (t) => setTrack(t));
     landmarker = lm;
     state.wasmBase = base;
 
@@ -1375,7 +1485,7 @@ async function startTracking() {
     state.live = false;
     lastVideoTime = -1;
     setTrack('等待人脸', 'ok');
-    setTrackDetail(`追踪已启用（wasm 来自${base === 'wasm' ? '本地副本' : 'CDN 兜底'}）：脸进画面后按 C 校准中立位。`);
+    setTrackDetail(`追踪已启用（wasm 来自${label}）：脸进画面后按 C 校准中立位。`);
     if (btn) { btn.disabled = false; btn.textContent = '重启追踪'; btn.classList.add('on'); }
     toast('追踪已启用，把脸放进画面，按 C 校准');
   } catch (err) {

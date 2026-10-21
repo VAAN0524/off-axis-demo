@@ -174,10 +174,14 @@ three r186 的 `GaussianSplat` 有个硬限制：NodeMaterial 来自 `three/webg
 - `google-ai-edge/mediapipe#4827`：官方维护者明确说 *"You can also use a custom location for the WASM files by passing it to `FilesetResolver.forVisionTasks('http:/...')`"*
 - `#5495`：**同时加载 legacy `@mediapipe/pose` 和 `@mediapipe/tasks-vision` 会撞出两个 emscripten runtime**，症状就是各种 `Aborted` —— 一个页面只能有一份
 - 通行做法（Cam2Hologram、parallax 类项目）：把 `vision_bundle.mjs` + `wasm/` 一起 vendored 进仓库，CDN 只作兜底
+- `#5380` / `#5512` 一类 issue 里反复出现 `NetworkError when attempting to fetch resource.`，回复基本都是「路径不对 / 服务器没给 `application/wasm`」。但我们实测到第三种成因：**环境把 fetch 通道整体禁掉**（`file://`、sandbox iframe），此时报错和路径、MIME 全都无关 —— 判别方法是看同源相对路径是否也挂
+- 打包器侧的同类思路：Vite 的 `assetsInlineLimit` / `?inline`、webpack 的 `asset/inline` 都是把二进制变 base64 塞进 JS，绕开独立请求。`emscripten` 自己也支持 `-sSINGLE_FILE=1` 生成「wasm 内嵌」的单文件 —— 官方给的正是这条路
 
 ## 七、已经落地 / 还没做
 
 **已落地**
+
+0. **fetch 被禁时的第三层兜底**（2026-10-21 追加）：实测 `file://` 与 sandbox iframe 两种受限环境下，`fetch` / `XHR` / 同源 `import` 全部失败，但 classic `<script>`、`fetch(blob:)`、`DecompressionStream` 三条通道可用。于是 `tools/pack_wasm.py` 把 wasm 压成 gzip+base64 的普通脚本（9.0MB → 2.7MB → 3.7MB），页面在 fetch 三源全败后注入它，解码 → gunzip → `blob:` 交给 MediaPipe。模拟 fetch 全失败实测 **2.6s** 到「等待人脸」。这与 emscripten 官方 `-sSINGLE_FILE=1` 是同一个思路，只是我们在运行时做，不重新编译。
 
 1. **vendor MediaPipe 运行时**：`wasm/` 放仓库里，`FilesetResolver.forVisionTasks('wasm')` 优先，CDN 两源兜底。
    实测数据（别再被 curl 的 `size_download` 骗了，那是**压缩后**大小）：
