@@ -1003,7 +1003,16 @@ let starting = false;
  * 所以 wasm 必须同源自带，版本本身救不了。换版本时 wasm/ 里四个文件一起换。
  */
 const MP_VERSION = '0.10.14';
+/**
+ * 实测速度（深圳 / 家宽，同一个 137KB 的 vision_bundle.mjs）：
+ *   registry.npmmirror.com  538 KB/s      ← 国内镜像，放第一位
+ *   cdn.jsdelivr.net        242 KB/s
+ *   unpkg.com                60 KB/s
+ * 差一个量级的差距，9.4MB 的 wasm 上表现更明显。
+ */
+const NPMMIRROR = `https://registry.npmmirror.com/@mediapipe/tasks-vision/${MP_VERSION}/files`;
 const MP_BUNDLES = [
+  `${NPMMIRROR}/vision_bundle.mjs`,
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
   `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
 ];
@@ -1016,6 +1025,7 @@ const MP_BUNDLES = [
  */
 const MP_WASM_BASES = [
   'wasm',
+  `${NPMMIRROR}/wasm`,
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
   `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
 ];
@@ -1448,7 +1458,10 @@ async function createLandmarker(mp, bases, buffer, onStatus) {
     console.warn('[track] 内置副本失败', e?.message || e);
   }
 
-  throw new Error('wasm 运行时加载失败（' + errs.join('；') + '）'
+  // 四个源很可能报同一句话，去重后再说，别让面板被重复文案撑爆
+  const uniq = [...new Set(errs.map((s) => s.replace(/^[^：]*：/, '')))];
+  throw new Error('wasm 运行时加载失败（' + errs.length + ' 个来源都试过了：'
+    + uniq.join('；') + '）'
     + '〔环境：' + envDiagnostics() + '〕'
     + (location.origin === 'null'
       ? '。当前页面被预览框隔离了（origin=null），浏览器的网络请求通道被整体禁用，试试点面板里的「新窗口打开」'

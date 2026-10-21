@@ -166,10 +166,21 @@ Aborted(both async and sync fetching of the wasm failed). Build with -sASSERTION
 ```js
 const MP_WASM_BASES = [
   'wasm',                    // 同源副本，秒开、断网可用
+  `${NPMMIRROR}/wasm`,       // registry.npmmirror.com，国内实测 900 KB/s
   `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
   `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
 ];
 ```
+
+顺带实测了三个公网源的速度（同一个 137 KB 的 `vision_bundle.mjs`，深圳家宽）：
+
+| 源 | 速度 |
+| --- | --- |
+| `registry.npmmirror.com` | **538 KB/s** |
+| `cdn.jsdelivr.net` | 242 KB/s |
+| `unpkg.com` | 60 KB/s |
+
+差一个量级，9.4 MB 的 wasm 上更明显 —— 所以国内镜像排第一。GitHub Pages 上的实测也印证：同源 9.4 MB 在弱网下 34 秒只跑到 38%。
 
 `FilesetResolver.forVisionTasks(base)` 只是拼路径 + 探测 SIMD 能力，**不会真下载 wasm**。实测它返回的就是两个字符串：
 
