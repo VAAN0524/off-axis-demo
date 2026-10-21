@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>头部视差 · 3DGS 离轴投影</title>
+<style>
+  :root{
+    --bg:#06080c; --ink:#e9edf6; --dim:#7f8899;
+    --line:rgba(255,255,255,.10); --panel:rgba(12,16,24,.84);
+    --a1:#7B61FF; --a2:#FFD23F; --a3:#FF5C7A;
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; height:100%; background:var(--bg); color:var(--ink); overflow:hidden;
+    font:13px/1.55 -apple-system,"PingFang SC","Helvetica Neue",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  #app canvas{ display:block; position:fixed; inset:0; }
+
+  /* 左上：调试数值 */
+  #hud{
+    position:fixed; left:14px; top:14px; min-width:190px; padding:10px 12px;
+    border-radius:10px; background:var(--panel); border:1px solid var(--line);
+    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    font-variant-numeric:tabular-nums; pointer-events:none;
+  }
+  #hud .row{ display:flex; justify-content:space-between; gap:16px; }
+  #hud .k{ color:var(--dim); }
+  #hud .v{ text-align:right; }
+
+  /* 右上：摄像头预览 */  #camwrap{
+    position:fixed; right:14px; top:14px; width:196px; border-radius:10px; overflow:hidden;
+    border:1px solid var(--line); background:#000; box-shadow:0 10px 30px rgba(0,0,0,.45);
+  }
+  #camwrap.hidden{ display:none; }
+  #camwrap video{ display:block; width:100%; height:auto; transform:scaleX(-1); opacity:.82; }
+
+  /* 右下：测试场景的深度图例 */
+  #legend{
+    position:fixed; right:14px; bottom:14px; padding:9px 12px; border-radius:10px;
+    background:var(--panel); border:1px solid var(--line);
+    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    display:flex; flex-direction:column; gap:6px; pointer-events:none;
+  }
+  #legend.hidden{ display:none; }
+  #legend .lg{ display:flex; align-items:center; gap:8px; font-size:12px; color:#aab3c6; }
+  #legend .lg i{ width:16px; height:2px; border-radius:2px; }
+
+  /* 左下：控制面板 */
+  #panel{
+    position:fixed; left:14px; bottom:14px; width:266px; border-radius:12px;
+    background:var(--panel); border:1px solid var(--line);
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    box-shadow:0 14px 44px rgba(0,0,0,.5); overflow:hidden;
+    display:flex; flex-direction:column;
+    /* 面板长高了：留出 HUD 的高度，超出的部分内部滚动，别把读数挡住 */
+    max-height:calc(100vh - 200px);
+  }
+  #panel.collapsed .p-body{ display:none; }
+  .p-head{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:8px 12px; border-bottom:1px solid var(--line);
+    font-weight:600; letter-spacing:.02em;
+  }
+  .p-head button{
+    background:none; border:0; color:var(--dim); font-size:15px;
+    cursor:pointer; padding:0 4px; line-height:1;
+  }
+  .p-body{ padding:10px 12px 12px; display:flex; flex-direction:column; gap:10px; overflow-y:auto; min-height:0; }
+
+  .seg{ display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button{
+    flex:1; padding:6px 0; background:transparent; border:0; color:var(--dim);
+    font:inherit; cursor:pointer; transition:background .15s,color .15s;
+  }
+  .seg button.on{ background:rgba(123,97,255,.22); color:#cfc6ff; }
+
+  .ctl{ display:flex; flex-direction:column; gap:5px; }
+  .ctl-h{ display:flex; justify-content:space-between; color:var(--dim); font-size:12px; }
+  .ctl-h output{ color:var(--ink); font-variant-numeric:tabular-nums; }
+  input[type=range]{ width:100%; height:14px; margin:0; accent-color:var(--a1); cursor:pointer; }
+
+  .chk{ display:flex; align-items:center; gap:7px; color:var(--dim); font-size:12px; cursor:pointer; }
+  .chk input{ accent-color:var(--a1); margin:0; }
+
+  .btns{ display:flex; gap:8px; }
+  .btns button{
+    flex:1; padding:6px 0; border-radius:8px; border:1px solid var(--line);
+    background:rgba(255,255,255,.04); color:var(--ink); font:inherit; cursor:pointer;
+  }
+  .btns button:hover{ background:rgba(255,255,255,.09); }
+
+  #btnModel{
+    flex:2; padding:7px 0; border-radius:8px; border:1px solid rgba(123,97,255,.5);
+    background:rgba(123,97,255,.16); color:#cfc6ff; font:inherit; cursor:pointer;
+  }
+  #btnModel:hover:not(:disabled){ background:rgba(123,97,255,.3); }
+  #btnModel:disabled{
+    background:transparent; border-style:dashed; border-color:var(--line);
+    color:#5b6479; cursor:not-allowed;
+  }
+  #btnYaw{ flex:0 0 78px; }
+  #btnYaw:disabled{ color:#4d5568; cursor:not-allowed; }
+
+  #btnTrack, #btnOpen, #btnPickModel{
+    width:100%; padding:7px 0; border-radius:8px; border:1px solid var(--line);
+    background:rgba(255,255,255,.04); color:var(--ink); font:inherit; cursor:pointer;
+    transition:background .15s,border-color .15s,color .15s;
+  }
+  #btnOpen{ display:none; border-color:rgba(255,210,63,.4); color:#ffe08a; }
+  #btnOpen.show{ display:block; }
+  #btnPickModel{ display:none; border-color:rgba(123,97,255,.45); color:#cfc6ff; }
+  #btnPickModel.show{ display:block; }
+  #btnTrack:hover:not(:disabled), #btnOpen:hover, #btnPickModel:hover{ background:rgba(255,255,255,.09); }
+  #btnTrack:disabled{ color:#5b6479; cursor:progress; }
+  #btnTrack.on{ border-color:rgba(78,201,140,.5); background:rgba(78,201,140,.14); color:#96e9bd; }
+  #trackMsg{ color:#8a93a6; }
+  #trackMsg.bad{ color:#ff9aa8; }
+  .tip{ margin:0; font-size:11px; line-height:1.55; color:#646e86; }
+
+  /* 底部提示 */
+  #toast{
+    position:fixed; left:50%; bottom:26px; transform:translate(-50%,12px);
+    padding:9px 16px; border-radius:999px; font-size:12px;
+    background:rgba(20,26,38,.94); border:1px solid var(--line);
+    box-shadow:0 8px 30px rgba(0,0,0,.5); opacity:0; pointer-events:none;
+    transition:opacity .22s,transform .22s; max-width:70vw; text-align:center;
+  }
+  #toast.show{ opacity:1; transform:translate(-50%,0); }
+
+  /* file:// 打开时的显著提示：不说明白，用户只会看到一堆 NetworkError */
+  #fileWarn{
+    position:fixed; left:50%; top:16px; transform:translateX(-50%); z-index:60;
+    display:none; max-width:min(720px, 92vw);
+    padding:12px 16px; border-radius:12px; font-size:12px; line-height:1.7;
+    background:rgba(52,22,24,.96); border:1px solid rgba(255,120,140,.5);
+    color:#ffd7dd; box-shadow:0 10px 34px rgba(0,0,0,.55);
+  }
+  #fileWarn.show{ display:block; }
+  #fileWarn b{ color:#fff0f2; }
+  #fileWarn code{
+    display:inline-block; margin:2px 0; padding:2px 7px; border-radius:5px;
+    background:rgba(0,0,0,.45); color:#ffe9a8; font-family:ui-monospace, Menlo, monospace; font-size:11px;
+    user-select:all; -webkit-user-select:all;
+  }
+  #fileWarn a{ color:#8fd4ff; text-decoration:none; border-bottom:1px solid currentColor; }
+  #fileWarn .x{
+    position:absolute; right:8px; top:6px; border:0; background:transparent;
+    color:#c89aa2; font-size:16px; cursor:pointer; line-height:1;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+    "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.webgpu.js",
+    "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.tsl.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="fileWarn">
+  <button class="x" id="btnFileWarnClose" title="关闭">×</button>
+  <b>当前用本地文件打开（file://），浏览器会拦掉同目录的图片与模型。</b><br />
+  所以照片加载不出来、人脸模型也会报 NetworkError。用 http 打开即可：
+  <code>cd head-parallax-3dgs &amp;&amp; python3 -m http.server 8123</code><br />
+  然后访问 <a href="http://127.0.0.1:8123/index.html" target="_blank" rel="noreferrer">http://127.0.0.1:8123/index.html</a>
+  （也可以把 face_landmarker.task 直接拖进窗口，先让追踪跑起来）
+</div>
+
+<div id="hud">
+  <div class="row"><span class="k">渲染器</span><span class="v" id="hudBackend">—</span></div>
+  <div class="row"><span class="k">追踪</span><span class="v" id="hudTrack">初始化</span></div>
+  <div class="row"><span class="k">眼睛 x/y</span><span class="v" id="hudEye">—</span></div>
+  <div class="row"><span class="k">眼到屏幕</span><span class="v" id="hudZ">—</span></div>
+  <div class="row"><span class="k">帧率</span><span class="v" id="hudFps">—</span></div>
+</div>
+
+<div id="camwrap" class="hidden"><video id="cam" playsinline muted></video></div>
+
+<div id="legend"></div>
+
+<div id="panel">
+  <div class="p-head"><span>离轴视差</span><button id="btnCollapse" title="H">–</button></div>
+  <div class="p-body">
+    <div class="seg" id="segMode">
+      <button data-mode="offaxis" class="on">真离轴</button>
+      <button data-mode="naive">相机平移</button>
+    </div>
+
+    <div class="ctl">
+      <div class="ctl-h"><span>灵敏度</span><output id="oSens">1.00</output></div>
+      <input id="iSens" type="range" min="0.2" max="2" step="0.05" value="1" />
+    </div>
+
+    <div class="ctl">
+      <div class="ctl-h"><span>平滑</span><output id="oSm">55</output></div>
+      <input id="iSm" type="range" min="0" max="100" step="1" value="55" />
+    </div>
+
+    <div class="ctl">
+      <div class="ctl-h"><span>屏幕对角线</span><output id="oDiag">27″</output></div>
+      <input id="iDiag" type="range" min="13" max="49" step="1" value="27" />
+    </div>
+
+    <div class="ctl">
+      <div class="ctl-h"><span>照片层不透明度</span><output id="oOpac">100</output></div>
+      <input id="iOpac" type="range" min="15" max="100" step="1" value="100" />
+    </div>
+
+    <label class="chk"><input id="iMirror" type="checkbox" checked /> 前置摄像头（按镜像解读）</label>
+    <label class="chk"><input id="iTest" type="checkbox" checked /> 显示测试场景</label>
+
+    <button id="btnTrack">启用摄像头追踪</button>
+    <p class="tip" id="trackMsg">未启用：用鼠标移动模拟头部，滚轮模拟前后。</p>
+    <button id="btnOpen">在新窗口打开（嵌入预览常拦截摄像头）</button>
+    <button id="btnPickModel">选择模型文件…（可用 models/face_landmarker.task）</button>
+    <input id="fileModel" type="file" accept=".task" hidden />
+
+    <div class="btns">
+      <button id="btnCal">校准 (C)</button>
+      <button id="btnReset">复位 (R)</button>
+    </div>
+
+    <div class="btns">
+      <button id="btnModel" disabled>未找到 model.spz</button>
+      <button id="btnYaw" disabled title="模型朝向不对时掰一下">旋转 90°</button>
+    </div>
+
+    <p class="tip">三层照片按 0.48 / 1.05 / 1.85 m 摆放，边缘做了 alpha 羽化，所以前景会自然融进后面，遮挡关系仍是真遮挡。没有摄像头时鼠标 = 头部、滚轮 = 前后；把 .spz / .ply / .splat / .ksplat 拖进窗口可换任意 3DGS 场景。</p>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script type="module">
+/* ══════════════════════════════════════════════════════════════════
+   头部视差 3DGS 查看器
+   ──────────────────────────────────────────────────────────────────
+   坐标约定（世界 / 米）：
+     +x 观察者右手方向   +y 上   +z 指向观察者
+     屏幕平面固定在 z = 0，观察者位于 z > 0
+   所以 3D 内容必须放在 z < 0（屏幕后面），相机在 z = eye.z。
+   ══════════════════════════════════════════════════════════════════ */
+
+import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
+import { GaussianSplat } from 'three/addons/objects/GaussianSplat.js';
+import { SPZLoader } from 'three/addons/loaders/SPZLoader.js';
+import { GaussianSplatPLYLoader } from 'three/addons/loaders/GaussianSplatPLYLoader.js';
+import { SPLATLoader } from 'three/addons/loaders/SPLATLoader.js';
+import { KSPLATLoader } from 'three/addons/loaders/KSPLATLoader.js';
+
+/* ── 常量 ──────────────────────────────────────────────────────── */
+const INCH = 0.0254;
+const CAM_FOV_H = THREE.MathUtils.degToRad(60); // 假定摄像头水平视场 60°，用于像素→米
+const NEAR = 0.02;
+const FAR = 60;
+const SCENE_Z = -1.15; // 近似模式下相机 lookAt 的目标深度
+const MODEL_Z = -1.4; // 3DGS 模型中心放置的深度
+
+/** 模型归一化结果，旋转后要重新摆放 */
+let modelFit = null;
+
+/* ── 可调参数 ──────────────────────────────────────────────────── */
+const params = {
+  mode: 'offaxis', // 'offaxis' 真离轴 ｜ 'naive' 相机平移近似
+  sensitivity: 1.0,
+  smoothing: 55,   // 0 = 跟手但抖，100 = 很稳但有延迟
+  diagonal: 27,    // 屏幕对角线（英寸）
+  mirror: true,    // 前置摄像头未镜像，默认取反
+  showTest: true,
+  foreOpaque: 1.0,  // 照片层不透明度（1 = 实心，越低越透）
+};
+
+const state = {
+  tracking: false,   // MediaPipe 是否就绪
+  live: false,       // 当前是否检到人脸
+  backend: '—',
+  ipdPx: 0,
+  pointerZ: 0.6,
+  splat: null,
+};
+
+/* ── 屏幕物理尺寸：由对角线 + 当前视口比例推出来 ────────────────── */
+const screen = { w: 0.6, h: 0.34 };
+function updateScreenSize() {
+  const a = innerWidth / innerHeight;
+  const d = params.diagonal * INCH;
+  screen.h = d / Math.sqrt(1 + a * a);
+  screen.w = screen.h * a;
+}
+
+/* ── 眼睛状态（米） ───────────────────────────────────────────── */
+const eye = { x: 0, y: 0, z: 0.6 };    // 平滑后的值，直接喂给相机
+const target = { x: 0, y: 0, z: 0.6 }; // 原始观测量
+const calib = { ready: false, cx: 0.5, cy: 0.5, ipd: 0, z: 0.6 };
+
+/* ── One Euro 滤波器：低速重平滑、高速低延迟，比固定指数平滑好用 ── */
+class OneEuroFilter {
+  constructor(minCutoff = 2, beta = 0.8, dCutoff = 1) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.xPrev = null;
+    this.dxPrev = 0;
+  }
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  filter(x, dt) {
+    if (this.xPrev === null) { this.xPrev = x; return x; }
+    const dx = (x - this.xPrev) / dt;
+    const aD = OneEuroFilter.alpha(this.dCutoff, dt);
+    this.dxPrev = aD * dx + (1 - aD) * this.dxPrev;
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dxPrev);
+    const a = OneEuroFilter.alpha(cutoff, dt);
+    this.xPrev = a * x + (1 - a) * this.xPrev;
+    return this.xPrev;
+  }
+  reset(v = null) { this.xPrev = v; this.dxPrev = 0; }
+}
+const filters = {
+  x: new OneEuroFilter(),
+  y: new OneEuroFilter(),
+  z: new OneEuroFilter(),
+};
+function applyFilterSettings() {
+  // 平滑滑杆 0→8Hz（跟手）  100→0.45Hz（很稳）
+  const cutoff = 8 - 7.55 * (params.smoothing / 100);
+  for (const k of ['x', 'y', 'z']) {
+    filters[k].minCutoff = cutoff;
+    filters[k].beta = 0.9;
+  }
+}
+
+/* ── 渲染器 / 场景 / 相机 ──────────────────────────────────────── */
+let renderer = null;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x06080c);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, NEAR, FAR);
+camera.position.set(0, 0, 0.6);
+
+const splatRoot = new THREE.Group();
+scene.add(splatRoot);
+
+/* ══════════════════════════════════════════════════════════════════
+   3DGS 模型加载
+   ══════════════════════════════════════════════════════════════════ */
+const LOADERS = {
+  spz: () => new SPZLoader(),
+  ply: () => new GaussianSplatPLYLoader(),
+  splat: () => new SPLATLoader(),
+  ksplat: () => new KSPLATLoader(),
+};
+
+async function loadSplat(url, ext, orientation = [0, Math.PI, 0]) {
+  if (!renderer?.isWebGPURenderer) {
+    toast('3DGS 需要 WebGPU：当前已回退到 WebGL，只能看照片场景');
+    return;
+  }
+  const make = LOADERS[ext];
+  if (!make) throw new Error('不支持的格式：.' + ext);
+
+  const geometry = await make().loadAsync(url);
+  const splat = new GaussianSplat(geometry, { autoSort: true });
+  splat.frustumCulled = false;
+
+  // 朝向：扫描件多半正面朝 -Z（背对 three 的默认相机），默认先转 180°；
+  // 具体样本可能还有别的翻转，用参数覆盖，或者点面板里的「旋转 90°」手动掰。
+  splat.rotation.set(...orientation);
+
+  // 自动归一化：最长边缩到 0.55m，中心放在屏幕后 1.4m
+  try { geometry.computeBoundingBox?.(); } catch { /* 无 positions 的几何体 */ }
+  const box = geometry.boundingBox;
+  if (box && !box.isEmpty()) {
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    modelFit = { center, scale: 0.55 / maxDim };
+  } else {
+    modelFit = { center: new THREE.Vector3(), scale: 1 };
+  }
+
+  // 换模型
+  if (state.splat) {
+    splatRoot.remove(state.splat);
+    state.splat.splatGeometry?.dispose?.();
+  }
+  state.splat = splat;
+  splatRoot.add(splat);
+  placeSplat();
+
+  // 有真模型就把照片场景收起来
+  params.showTest = false;
+  document.getElementById('iTest').checked = false;
+  applyTestVisibility();
+  document.getElementById('btnYaw').disabled = false;
+  toast('3DGS 已加载（朝向不对就点「旋转 90°」）');
+}
+
+/** 按当前旋转把模型摆正并居中，旋转后要重新算一次 */
+function placeSplat() {
+  const sp = state.splat;
+  if (!sp || !modelFit) return;
+  sp.scale.setScalar(modelFit.scale);
+  const q = new THREE.Quaternion().setFromEuler(sp.rotation);
+  const c = modelFit.center.clone().multiplyScalar(modelFit.scale).applyQuaternion(q);
+  sp.position.set(-c.x, -c.y, MODEL_Z - c.z);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   测试场景：三层真实照片（替代原来的粒子点阵）
+   每层是一张不透明照片，深度不同 → 视差位移 + 前后遮挡都能直接看出来
+   ══════════════════════════════════════════════════════════════════ */
+let testGroup = null;
+
+/**
+ * 三层深度图例。颜色即该层照片的边框色，方便对着画面认层。
+ * 每层都是「中间实心、边缘羽化」的 alpha 贴图，所以前景不再是死板的方块。
+ */
+const LEGEND = [
+  { color: '#7B61FF', text: '前景 0.48 m' },
+  { color: '#FFD23F', text: '中景 1.05 m' },
+  { color: '#FF5C7A', text: '背景 1.85 m' },
+];
+
+/**
+ * feather = 羽化宽度占短边的比例：0.12 表示边缘 12% 渐隐为全透明。
+ * order 显式指定绘制顺序（远→近），不依赖渲染器排序，
+ * 这样 transparent + depthWrite:false 的组合在离轴投影下也稳定。
+ * 背景图尺寸要够大：眼位横移 ±25cm 时，1.85m 深处的可视宽度约 4.4m，
+ * 小了就会在画面边缘露出底色。
+ */
+const PHOTO_LAYERS = [
+  { src: 'img/far.jpg',  remote: 'https://picsum.photos/id/43/1600/1000', z: -1.85, w: 4.40,  h: 2.75,   x: 0,      y: 0,     color: 0xFF5C7A, dim: 0.90, feather: 0.035, order: 0 },
+  { src: 'img/mid.jpg',  remote: 'https://picsum.photos/id/50/1280/800',  z: -1.05, w: 0.56,  h: 0.35,   x: -0.14,  y: 0.13,  color: 0xFFD23F, dim: 1,    feather: 0.12,  order: 1 },
+  { src: 'img/near.jpg', remote: 'https://picsum.photos/id/48/960/600',   z: -0.48, w: 0.30,  h: 0.1875, x: 0.235,  y: -0.12, color: 0x7B61FF, dim: 1,    feather: 0.10,  order: 2 },
+];
+
+const texLoader = new THREE.TextureLoader();
+let maxAniso = 8;
+const photoMats = [];
+
+/** 圆角矩形路径（老浏览器没有 roundRect 就退回直角） */
+function roundRectPath(ctx, x, y, w, h, r) {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/**
+ * 照片 → 带 alpha 的贴图。
+ *   1) 先按 cover 裁进 canvas（只裁不拉伸，不靠 repeat/offset）
+ *   2) 画一圈同色细边框，作为视差位移的参照
+ *   3) 用 destination-in 乘一张柔边圆角蒙版 → 边缘真的透明
+ */
+function makePhotoTexture(img, planeAspect, feather, tint) {
+  const W = Math.min(1600, img.width || 1024);
+  const H = Math.max(1, Math.round(W / planeAspect));
+  const cv = document.createElement('canvas');
+  cv.width = W;
+  cv.height = H;
+  const ctx = cv.getContext('2d');
+
+  // cover 裁切
+  const ia = (img.width || 1) / (img.height || 1);
+  let sx = 0, sy = 0, sw = img.width, sh = img.height;
+  if (ia > planeAspect) {
+    sw = img.height * planeAspect;
+    sx = (img.width - sw) / 2;
+  } else {
+    sh = img.width / planeAspect;
+    sy = (img.height - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
+
+  // 参照边框
+  if (tint) {
+    const lw = Math.max(2, Math.round(W * 0.0028));
+    ctx.strokeStyle = '#' + new THREE.Color(tint).getHexString();
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = lw;
+    roundRectPath(ctx, lw * 1.5, lw * 1.5, W - lw * 3, H - lw * 3, Math.min(W, H) * 0.045);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // 羽化蒙版
+  const f = Math.max(2, Math.min(W, H) * feather);
+  ctx.globalCompositeOperation = 'destination-in';
+  const canBlur = typeof ctx.filter === 'string';
+  if (canBlur) ctx.filter = `blur(${Math.round(f * 0.55)}px)`;
+  ctx.fillStyle = '#fff';
+  const inset = f * 0.55;
+  roundRectPath(ctx, inset, inset, W - inset * 2, H - inset * 2, Math.min(W, H) * 0.04);
+  ctx.fill();
+  if (canBlur) ctx.filter = 'none';
+  ctx.globalCompositeOperation = 'source-over';
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAniso;
+  return tex;
+}
+
+function buildPhotoLayer({ src, remote, z, w, h, x, y, color, dim, feather, order }) {
+  const grp = new THREE.Group();
+  grp.position.set(x, y, z);
+
+  // 图没到之前先给个很暗的底，避免首帧闪白
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x11151d, toneMapped: false,
+    transparent: true, depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  mesh.renderOrder = order;
+  grp.add(mesh);
+  photoMats.push(mat);
+
+  const apply = (img) => {
+    if (!img?.width) return;
+    mat.map = makePhotoTexture(img, w / h, feather, color);
+    mat.color.setScalar(dim);
+    mat.opacity = params.foreOpaque;
+    mat.needsUpdate = true;
+  };
+
+  const fromUrl = (url, onError) => texLoader.load(url, (tex) => {
+    const img = tex.image;
+    tex.dispose();
+    apply(img);
+  }, undefined, onError);
+
+  // 本地图 → 失败则退回远端同款图（file:// 打开时本地读不到，这样至少不是黑块）
+  fromUrl(src, () => {
+    if (remote) fromUrl(remote, () => { /* 都失败就保持深色底 */ });
+  });
+
+  return grp;
+}
+
+function applyPhotoOpacity() {
+  for (const m of photoMats) m.opacity = params.foreOpaque;
+}
+
+/** 兜底：照片之外的地方给一堵很暗的墙，别让画面边缘是纯黑虚空 */
+function buildBackdrop() {
+  const mat = new THREE.MeshBasicMaterial({ color: 0x0a0d13, toneMapped: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(9, 5.6), mat);
+  mesh.position.z = -2.45;
+  return mesh;
+}
+
+function buildTestScene() {
+  const g = new THREE.Group();
+  g.add(buildBackdrop());
+  for (const layer of PHOTO_LAYERS) g.add(buildPhotoLayer(layer));
+  return g;
+}
+
+function buildLegend() {
+  const box = document.getElementById('legend');
+  box.innerHTML = LEGEND
+    .map((l) => `<div class="lg"><i style="background:${l.color}"></i><span>${l.text}</span></div>`)
+    .join('');
+}
+
+function applyTestVisibility() {
+  if (testGroup) testGroup.visible = params.showTest;
+  document.getElementById('legend').classList.toggle('hidden', !params.showTest);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   摄像头 → 眼睛位置
+   ══════════════════════════════════════════════════════════════════ */
+let video = null;
+let landmarker = null;
+let camStream = null;
+let lastVideoTime = -1;
+let lastDetectAt = 0;
+let detectInterval = 45; // ms，按单帧推理实际耗时自适应
+let starting = false;
+
+const MP_VERSION = '1.1.1';
+const MP_BUNDLES = [
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
+];
+const MP_WASM = [
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
+  `https://unpkg.com/@mediapipe/tasks-vision@${MP_VERSION}/wasm`,
+];
+/**
+ * 模型来源按顺序尝试，任何一条通就能起来：
+ *   1) 本地 .task —— fetch 读取，能显示下载百分比（http 环境最快）
+ *   2) 本地 .b64.js —— 用普通 <script> 加载，**不受 CORS 限制**，
+ *      所以 file:// 打开、断网、被 iframe 限制时都能用
+ *   3) Google 存储 —— 境外网络可达时的兜底（国内常被墙，速度也可能只有 280KB/s）
+ *   4) 手动：把 face_landmarker.task 拖进窗口
+ */
+const MODEL_SOURCES = [
+  { kind: 'fetch',  label: '本地文件', url: 'models/face_landmarker.task' },
+  { kind: 'script', label: '内置副本', url: 'models/face_landmarker.b64.js' },
+  { kind: 'fetch',  label: 'Google', url: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' },
+];
+
+/** 用户拖进来的模型（优先级最高），以及已经解出来的缓存 */
+let manualModelBuffer = null;
+let cachedModelBuffer = null;
+const isFileProtocol = () => location.protocol === 'file:';
+
+function setTrack(text, kind) {
+  const el = document.getElementById('hudTrack');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = kind === 'ok' ? '#7ee0a8' : kind === 'bad' ? '#ff8b9c' : '';
+}
+
+/** 面板里的详细原因（HUD 太窄，放不下整句） */
+function setTrackDetail(msg, bad) {
+  const el = document.getElementById('trackMsg');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('bad', !!bad);
+}
+
+function withTimeout(p, ms, msg) {
+  let t = 0;
+  return Promise.race([
+    Promise.resolve(p).finally(() => clearTimeout(t)),
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); }),
+  ]);
+}
+
+function cameraErrorText(err) {
+  const n = err?.name || '';
+  if (n === 'NotAllowedError' || n === 'SecurityError') return '摄像头权限被拒绝：点「重试追踪」再授权一次';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return '没有找到摄像头设备';
+  if (n === 'NotReadableError') return '摄像头被其它程序占用（关掉会议/直播软件再试）';
+  return '取摄像头失败：' + (err?.message || err);
+}
+
+/** ① 摄像头 */
+async function openCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error('这个页面拿不到摄像头 API：请用 http://localhost 或 https 打开，别用 file://，也不要在受限 iframe 里');
+  }
+  video = document.getElementById('cam');
+  try {
+    camStream = await withTimeout(navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: 'user' },
+      audio: false,
+    }), 12000, '取摄像头超时');
+  } catch (err) {
+    throw new Error(cameraErrorText(err));
+  }
+  video.srcObject = camStream;
+  video.muted = true;
+  video.playsInline = true;
+  try { await withTimeout(video.play(), 6000, '画面无法播放'); } catch { /* 继续，下面等 metadata */ }
+  if (!video.videoWidth) {
+    await new Promise((res) => {
+      video.addEventListener('loadedmetadata', res, { once: true });
+      setTimeout(res, 3000);
+    });
+  }
+  document.getElementById('camwrap').classList.remove('hidden');
+}
+
+/** ② MediaPipe 运行时（jsDelivr 为主，unpkg 备份） */
+async function loadRuntime() {
+  let lastErr;
+  for (let i = 0; i < MP_BUNDLES.length; i++) {
+    try {
+      const mp = await withTimeout(import(/* @vite-ignore */ MP_BUNDLES[i]), 15000, '运行时脚本下载超时');
+      const fileset = await withTimeout(
+        mp.FilesetResolver.forVisionTasks(MP_WASM[i] || MP_WASM[0]),
+        25000, 'wasm 下载超时',
+      );
+      return { mp, fileset };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error('MediaPipe 运行时加载失败（网络不通）：' + (lastErr?.message || ''));
+}
+
+/** base64 → Uint8Array（分块解码，5MB 也不会卡主线程太久） */
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const n = bin.length;
+  const out = new Uint8Array(n);
+  const CHUNK = 65536;
+  for (let i = 0; i < n; i += CHUNK) {
+    const end = Math.min(i + CHUNK, n);
+    for (let j = i; j < end; j++) out[j] = bin.charCodeAt(j);
+  }
+  return out;
+}
+
+/** 用普通 script 标签读模型：普通脚本不走 CORS，file:// 下也能加载 */
+function loadModelViaScript(url) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; reject(new Error('读取超时')); } }, 30000);
+
+    s.onload = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const b64 = window.__MP_FACE_MODEL_B64;
+      if (!b64) return reject(new Error('副本里没有数据（文件被截断？）'));
+      try {
+        const bytes = b64ToBytes(b64);
+        window.__MP_FACE_MODEL_B64 = null; // 立即释放 5MB 字符串
+        resolve(bytes);
+      } catch (e) {
+        reject(new Error('base64 解码失败：' + (e?.message || e)));
+      }
+    };
+    s.onerror = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(new Error('文件不存在或被浏览器拦截'));
+    };
+    s.src = url;
+    document.head.appendChild(s);
+  });
+}
+
+/** ③ 模型：多来源顺序尝试，每次失败都记下真正的原因 */
+async function fetchModelBuffer() {
+  if (manualModelBuffer) return manualModelBuffer;
+  if (cachedModelBuffer) return cachedModelBuffer;
+
+  const fails = [];
+  for (const src of MODEL_SOURCES) {
+    try {
+      let buf;
+      if (src.kind === 'script') {
+        setTrack(`读${src.label}…`);
+        buf = await loadModelViaScript(src.url);
+      } else {
+        setTrack(`下载模型（${src.label}）…`);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 45000);
+        try {
+          const res = await fetch(src.url, { signal: ctrl.signal });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const total = +(res.headers.get('content-length') || 0);
+          const reader = res.body?.getReader?.();
+          if (!reader) {
+            buf = new Uint8Array(await res.arrayBuffer());
+          } else {
+            const chunks = [];
+            let got = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+              got += value.length;
+              setTrack(total ? `模型 ${Math.round((got / total) * 100)}%` : '下载模型…');
+            }
+            buf = new Uint8Array(got);
+            let o = 0;
+            for (const c of chunks) { buf.set(c, o); o += c.length; }
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (!buf || buf.length < 100000) throw new Error('内容不完整（' + (buf?.length || 0) + ' 字节）');
+      cachedModelBuffer = buf;
+      return buf;
+    } catch (e) {
+      const why = e?.name === 'AbortError' ? '超时中断' : (e?.message || String(e));
+      fails.push(`${src.label}：${why}`);
+      console.warn(`[model] ${src.label} 失败：`, why);
+    }
+  }
+
+  // 全部失败：给出可执行的下一步，而不是一句 NetworkError
+  const hint = isFileProtocol()
+    ? '当前是本地文件方式（file://）打开，浏览器禁止读取同目录文件。请改用 http 打开，或把 face_landmarker.task 拖进窗口。'
+    : '可以把 models/face_landmarker.task 直接拖进窗口手动加载。';
+  throw new Error(`人脸模型读取失败（${fails.join('；')}）。${hint}`);
+}
+
+/** ④ 建 landmarker：GPU 不行自动退 CPU */
+async function createLandmarker(mp, fileset, buffer) {
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetBuffer: buffer, delegate },
+    runningMode: 'VIDEO',
+    numFaces: 1,
+  });
+  try {
+    // GPU delegate 在部分环境会静默卡住，6 秒没起来就换 CPU，别让整条链路干等
+    return await withTimeout(mp.FaceLandmarker.createFromOptions(fileset, opts('GPU')), 6000, 'GPU 初始化超时');
+  } catch {
+    return await mp.FaceLandmarker.createFromOptions(fileset, opts('CPU'));
+  }
+}
+
+/** 启动 / 重启追踪：分阶段报状态，任何一步失败都说清原因 */
+async function startTracking() {
+  if (starting) return;
+  starting = true;
+  const btn = document.getElementById('btnTrack');
+  if (btn) { btn.disabled = true; btn.textContent = '启用中…'; }
+
+  try {
+    setTrackDetail('正在请求摄像头…');
+    setTrack('取摄像头…');
+    await openCamera();
+
+    setTrackDetail('摄像头已就绪，加载 MediaPipe 运行时…');
+    setTrack('加载运行时…');
+    const { mp, fileset } = await loadRuntime();
+
+    setTrackDetail('运行时已就绪，读取人脸模型…');
+    setTrack('下载模型…');
+    const buffer = await fetchModelBuffer();
+
+    setTrack('初始化模型…');
+    landmarker = await createLandmarker(mp, fileset, buffer);
+
+    state.tracking = true;
+    state.live = false;
+    lastVideoTime = -1;
+    setTrack('等待人脸', 'ok');
+    setTrackDetail('追踪已启用：脸进画面后按 C 校准中立位。');
+    if (btn) { btn.disabled = false; btn.textContent = '重启追踪'; btn.classList.add('on'); }
+    toast('追踪已启用，把脸放进画面，按 C 校准');
+  } catch (err) {
+    console.warn('[track]', err);
+    state.tracking = false;
+    const msg = err?.message || String(err);
+    const framed = (() => { try { return window.self !== window.top; } catch { return true; } })();
+    const modelIssue = /模型/.test(msg);
+    setTrack('未启用', 'bad');
+    setTrackDetail(msg + (modelIssue ? '' : '（点上面的按钮重试；也可以先用鼠标模拟头部）'), true);
+    // 被嵌在预览框里时，摄像头权限多半被 iframe 策略拦掉 → 引导去新窗口
+    document.getElementById('btnOpen').classList.toggle('show', framed);
+    // 模型读不到时，给一个直接选文件的入口（file:// 下唯一能自洽救回来的办法）
+    document.getElementById('btnPickModel').classList.toggle('show', modelIssue);
+    if (btn) { btn.disabled = false; btn.textContent = '重试追踪'; btn.classList.remove('on'); }
+    toast(modelIssue ? '人脸模型没读到，可点面板里的「选择模型文件」手动载入' : msg);
+    // 摄像头通了但模型挂了：保留预览，让人知道摄像头本身是好的
+    if (!camStream) document.getElementById('camwrap').classList.add('hidden');
+  } finally {
+    starting = false;
+  }
+}
+
+/** 每帧最多检测一次（不重复喂同一帧） */
+function pullCameraFrame() {
+  if (!landmarker || !video || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  const now = performance.now();
+  if (now - lastDetectAt < detectInterval) return;
+  lastVideoTime = video.currentTime;
+  lastDetectAt = now;
+
+  let res;
+  try {
+    res = landmarker.detectForVideo(video, now);
+  } catch {
+    return;
+  }
+
+  // 推理越慢，检测频率越低，把主线程让给渲染（headless/CPU 代理时尤其明显）
+  const cost = performance.now() - now;
+  detectInterval = THREE.MathUtils.clamp(cost * 3, 40, 200);
+
+  const lm = res?.faceLandmarks?.[0];
+  if (!lm || lm.length < 400) { state.live = false; return; }
+  state.live = true;
+  ingestLandmarks(lm);
+}
+
+/** 468/478 个关键点 → 眼睛在屏幕前的 (x, y, z) 米 */
+function ingestLandmarks(lm) {
+  const vw = video.videoWidth || 640;
+  const vh = video.videoHeight || 480;
+
+  let cx, cy, ipdPx;
+
+  if (lm.length > 472) {
+    // 有虹膜点时直接用虹膜中心，最稳
+    const a = lm[468], b = lm[473];
+    cx = (a.x + b.x) * 0.5;
+    cy = (a.y + b.y) * 0.5;
+    ipdPx = Math.hypot((b.x - a.x) * vw, (b.y - a.y) * vh);
+  } else {
+    // 退化到双眼内外眼角（33/133 左，362/263 右）
+    const lo = lm[33], li = lm[133], ri = lm[362], ro = lm[263];
+    cx = (lo.x + li.x + ri.x + ro.x) * 0.25;
+    cy = (lo.y + li.y + ri.y + ro.y) * 0.25;
+    ipdPx = Math.hypot((ro.x - lo.x) * vw, (ro.y - lo.y) * vh);
+  }
+
+  if (!Number.isFinite(ipdPx) || ipdPx < 3) return;
+  state.ipdPx = ipdPx;
+  if (!calib.ready) calibrate(cx, cy, ipdPx);
+
+  // 针孔模型：瞳距在画面里越大 → 人越近（线性反比，比魔法常数稳得多）
+  const z = THREE.MathUtils.clamp(calib.z * calib.ipd / ipdPx, 0.25, 2.5);
+
+  // 同一角度偏移，离得越远对应的物理位移越大
+  const kx = 2 * Math.tan(CAM_FOV_H / 2) * z; // 整幅画面宽度 ≈ 多少米
+  const ky = kx * (vh / vw);
+  const sx = params.mirror ? -1 : 1;
+
+  target.x = (cx - calib.cx) * sx * kx * params.sensitivity;
+  target.y = (calib.cy - cy) * ky * params.sensitivity;
+  target.z = calib.z + (z - calib.z) * params.sensitivity;
+}
+
+function calibrate(cx, cy, ipdPx) {
+  calib.cx = cx;
+  calib.cy = cy;
+  calib.ipd = ipdPx;
+  calib.z = 0.6; // 假定校准时坐在屏幕前 60cm
+  calib.ready = true;
+  filters.x.reset(target.x);
+  filters.y.reset(target.y);
+  filters.z.reset(target.z);
+}
+
+function recalibrate() {
+  calib.ready = false;
+  if (!state.live || !video) toast('已重置校准，检测到人脸后自动记录中立位');
+  else toast('已按当前姿态重新校准（假定 60cm）');
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   相机：两种模式
+   ══════════════════════════════════════════════════════════════════ */
+const camCenter = new THREE.Vector3(0, 0, SCENE_Z);
+const _mProj = new THREE.Matrix4();
+
+function updateCamera() {
+  if (params.mode === 'offaxis') applyOffAxisCamera();
+  else applyNaiveCamera();
+}
+
+/**
+ * 真离轴（广义透视 / Kooima）：
+ *   屏幕是固定的 z = 0 平面，眼睛在哪，屏幕四角射出的视锥就长什么样。
+ *   因为屏幕轴对齐，相机保持朝 -Z（四元数 = 单位阵），
+ *   左右上下不对称全部由投影矩阵的 l/r/t/b 承担 —— 这就是"真离轴"与
+ *   "平移 + lookAt" 的本质区别：后者光轴永远穿过屏幕中心。
+ */
+function applyOffAxisCamera() {
+  const d = Math.max(eye.z, 0.1);      // 眼到屏幕平面的距离
+  const k = NEAR / d;                  // 近平面处的缩放因子
+  const l = (-screen.w * 0.5 - eye.x) * k;
+  const r = ( screen.w * 0.5 - eye.x) * k;
+  const b = (-screen.h * 0.5 - eye.y) * k;
+  const t = ( screen.h * 0.5 - eye.y) * k;
+
+  // makePerspective 会按渲染器坐标系处理 NDC z（WebGL: -1..1 / WebGPU: 0..1）
+  const cs = renderer.coordinateSystem ?? THREE.WebGLCoordinateSystem;
+  _mProj.makePerspective(l, r, t, b, NEAR, FAR, cs);
+
+  camera.projectionMatrix.copy(_mProj);
+  camera.projectionMatrixInverse.copy(_mProj).invert();
+
+  camera.position.set(eye.x, eye.y, d);
+  camera.quaternion.identity();
+  camera.updateMatrixWorld();
+}
+
+/** 近似方案：相机跟着眼睛平移，再 lookAt 场景中心。便宜，但会丢离轴的那部分视差。 */
+function applyNaiveCamera() {
+  const s = params.sensitivity;
+  camera.position.set(eye.x * s, eye.y * s, eye.z);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(camCenter);
+  // 用屏幕尺寸反推垂直 FOV，让两种模式在原点处的取景完全一致，方便对比
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(screen.h / 2 / Math.max(eye.z, 0.1)));
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   主循环
+   ══════════════════════════════════════════════════════════════════ */
+let lastT = performance.now();
+let frames = 0, fpsAcc = 0;
+
+function smoothEye(dt) {
+  eye.x = THREE.MathUtils.clamp(filters.x.filter(target.x, dt), -1.2, 1.2);
+  eye.y = THREE.MathUtils.clamp(filters.y.filter(target.y, dt), -1.0, 1.0);
+  eye.z = THREE.MathUtils.clamp(filters.z.filter(target.z, dt), 0.25, 2.6);
+}
+
+function tick() {
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000 || 1 / 60, 0.1);
+  lastT = now;
+
+  if (state.tracking) pullCameraFrame();
+  smoothEye(dt);
+  updateCamera();
+  renderer.render(scene, camera);
+
+  frames++;
+  fpsAcc += dt;
+  if (fpsAcc > 0.4) {
+    setText('hudFps', Math.round(frames / fpsAcc) + ' fps');
+    frames = 0;
+    fpsAcc = 0;
+    updateHud();
+  }
+}
+
+function updateHud() {
+  setText('hudEye', `${(eye.x * 100).toFixed(1)} / ${(eye.y * 100).toFixed(1)} cm`);
+  setText('hudZ', (eye.z * 100).toFixed(0) + ' cm');
+  setText('hudBackend', state.backend);
+  if (state.tracking) {
+    setTrack(state.live ? '人脸锁定' : '等待人脸', state.live ? 'ok' : '');
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   UI
+   ══════════════════════════════════════════════════════════════════ */
+function setText(id, v) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = v;
+}
+
+let toastTimer = 0;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function setMode(mode) {
+  params.mode = mode;
+  for (const b of document.querySelectorAll('#segMode button')) {
+    b.classList.toggle('on', b.dataset.mode === mode);
+  }
+}
+
+function resetAll() {
+  target.x = 0; target.y = 0; target.z = 0.6;
+  eye.x = 0; eye.y = 0; eye.z = 0.6;
+  state.pointerZ = 0.6;
+  calib.ready = false;
+  filters.x.reset(0); filters.y.reset(0); filters.z.reset(0.6);
+  toast('已复位');
+}
+
+function bindUI() {
+  for (const b of document.querySelectorAll('#segMode button')) {
+    b.addEventListener('click', () => setMode(b.dataset.mode));
+  }
+
+  const iSens = document.getElementById('iSens');
+  iSens.addEventListener('input', () => {
+    params.sensitivity = +iSens.value;
+    document.getElementById('oSens').textContent = params.sensitivity.toFixed(2);
+  });
+
+  const iSm = document.getElementById('iSm');
+  iSm.addEventListener('input', () => {
+    params.smoothing = +iSm.value;
+    document.getElementById('oSm').textContent = params.smoothing;
+    applyFilterSettings();
+  });
+
+  const iDiag = document.getElementById('iDiag');
+  iDiag.addEventListener('input', () => {
+    params.diagonal = +iDiag.value;
+    document.getElementById('oDiag').textContent = params.diagonal + '″';
+    updateScreenSize();
+  });
+
+  const iOpac = document.getElementById('iOpac');
+  iOpac.addEventListener('input', () => {
+    params.foreOpaque = +iOpac.value / 100;
+    document.getElementById('oOpac').textContent = iOpac.value;
+    applyPhotoOpacity();
+  });
+
+  document.getElementById('iMirror').addEventListener('change', (e) => {
+    params.mirror = e.target.checked;
+  });
+  document.getElementById('iTest').addEventListener('change', (e) => {
+    params.showTest = e.target.checked;
+    applyTestVisibility();
+  });
+
+  document.getElementById('btnCal').addEventListener('click', recalibrate);
+  document.getElementById('btnReset').addEventListener('click', resetAll);
+  document.getElementById('btnTrack').addEventListener('click', () => startTracking());
+  document.getElementById('btnOpen').addEventListener('click', () => {
+    window.open(location.href, '_blank', 'noopener');
+  });
+
+  /* 手动选模型：file://、断网、模型被拦时都能救回来 */
+  const fileModel = document.getElementById('fileModel');
+  document.getElementById('btnPickModel').addEventListener('click', () => fileModel.click());
+  fileModel.addEventListener('change', async () => {
+    const f = fileModel.files?.[0];
+    if (!f) return;
+    try {
+      manualModelBuffer = new Uint8Array(await f.arrayBuffer());
+      document.getElementById('btnPickModel').classList.remove('show');
+      toast(`已读取 ${f.name}（${(manualModelBuffer.length / 1048576).toFixed(1)}MB），启用追踪…`);
+      startTracking();
+    } catch (err) {
+      toast('读取失败：' + (err?.message || err));
+    } finally {
+      fileModel.value = '';
+    }
+  });
+
+  const btnModel = document.getElementById('btnModel');
+  btnModel.addEventListener('click', async () => {
+    if (btnModel.disabled) return;
+    btnModel.disabled = true;
+    btnModel.textContent = '加载中…';
+    try {
+      await loadSplat('model.spz', 'spz', [0, Math.PI, Math.PI]);
+      btnModel.textContent = '重新载入 3DGS';
+    } catch (err) {
+      toast('加载失败：' + (err?.message || err));
+      btnModel.textContent = '载入 3DGS 样本';
+    } finally {
+      btnModel.disabled = false;
+    }
+  });
+
+  // 扫描件朝向千奇百怪，给一颗手动掰的按钮
+  document.getElementById('btnYaw').addEventListener('click', () => {
+    if (!state.splat) return;
+    state.splat.rotation.y += Math.PI / 2;
+    placeSplat();
+  });
+  document.getElementById('btnCollapse').addEventListener('click', () => {
+    document.getElementById('panel').classList.toggle('collapsed');
+  });
+
+  addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'c') recalibrate();
+    else if (k === 'r') resetAll();
+    else if (k === '1') setMode('offaxis');
+    else if (k === '2') setMode('naive');
+    else if (k === 'h') document.getElementById('panel').classList.toggle('collapsed');
+    else if (k === 't') {
+      params.showTest = !params.showTest;
+      document.getElementById('iTest').checked = params.showTest;
+      applyTestVisibility();
+    }
+  });
+
+  /* 无摄像头时的降级输入：鼠标 / 滚轮 */
+  addEventListener('pointermove', (e) => {
+    if (state.live) return;
+    target.x = (e.clientX / innerWidth - 0.5) * screen.w * 1.1;
+    target.y = -(e.clientY / innerHeight - 0.5) * screen.h * 1.1;
+    target.z = state.pointerZ;
+  }, { passive: true });
+
+  addEventListener('wheel', (e) => {
+    if (state.live) return;
+    state.pointerZ = THREE.MathUtils.clamp(state.pointerZ - e.deltaY * 0.0006, 0.3, 1.6);
+    target.z = state.pointerZ;
+  }, { passive: true });
+
+  /* 手动喂模型：断网 / file:// / 模型文件缺失时的最后一条路 */
+  addEventListener('dragover', (e) => e.preventDefault());
+  addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const f = e.dataTransfer?.files?.[0];
+    if (!f) return;
+    const ext = (f.name.split('.').pop() || '').toLowerCase();
+
+    if (ext === 'task') {
+      try {
+        manualModelBuffer = new Uint8Array(await f.arrayBuffer());
+        toast(`已读入手动模型 ${(manualModelBuffer.length / 1048576).toFixed(1)}MB，正在启用追踪…`);
+        startTracking();
+      } catch (err) {
+        toast('读取模型失败：' + (err?.message || err));
+      }
+      return;
+    }
+
+    toast('正在加载 ' + f.name + ' …');
+    try {
+      await loadSplat(URL.createObjectURL(f), ext);
+    } catch (err) {
+      toast('加载失败：' + (err?.message || err));
+    }
+  });
+}
+
+addEventListener('resize', () => {
+  updateScreenSize();
+  camera.aspect = innerWidth / innerHeight;
+  if (params.mode === 'naive') camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ══════════════════════════════════════════════════════════════════
+   启动
+   ══════════════════════════════════════════════════════════════════ */
+async function boot() {
+  // 0) file:// 直接摆明原因，别让人对着 NetworkError 猜
+  if (isFileProtocol()) {
+    document.getElementById('fileWarn').classList.add('show');
+    document.getElementById('btnFileWarnClose')?.addEventListener('click', (e) => {
+      e.currentTarget.closest('#fileWarn').classList.remove('show');
+    });
+  }
+
+  // 1) 渲染器：优先 WebGPU（3DGS 的唯一通路），失败退 WebGL 只跑测试场景
+  if (navigator.gpu) {
+    try {
+      renderer = new WebGPURenderer({ antialias: true });
+      await renderer.init();
+      state.backend = 'WebGPU';
+    } catch (err) {
+      console.warn('[demo] WebGPU 初始化失败，回退 WebGL:', err);
+      renderer = null;
+    }
+  }
+  if (!renderer) {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    state.backend = 'WebGL';
+  }
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  document.getElementById('app').appendChild(renderer.domElement);
+
+  // 贴图各向异性上限（WebGPU / WebGL 都是这个方法，取不到就用 8）
+  try { maxAniso = Math.min(8, renderer.getMaxAnisotropy?.() ?? 8); } catch { maxAniso = 8; }
+
+  // 2) 场景
+  updateScreenSize();
+  testGroup = buildTestScene();
+  scene.add(testGroup);
+  buildLegend();
+  applyTestVisibility();
+
+  // 3) UI
+  bindUI();
+  applyFilterSettings();
+  applyOffAxisCamera();
+
+  // 4) 先进渲染循环：首帧不能等网络和摄像头
+  lastT = performance.now();
+  renderer.setAnimationLoop(tick);
+
+  // 5) 探测同目录的 model.spz：有就点亮按钮（不自动加载，默认先看照片场景）
+  fetch('model.spz', { method: 'HEAD' }).then((r) => {
+    if (!r.ok) return;
+    const btn = document.getElementById('btnModel');
+    btn.disabled = false;
+    btn.textContent = '载入 3DGS 样本';
+  }).catch(() => {});
+
+  // 6) 摄像头追踪：自动试一次，失败也不阻塞（原因写进面板，可随时重试）
+  setTimeout(() => startTracking(), 350);
+
+  // 7) 留着给控制台调试：__parallax.ingest(landmarks) 可以喂假关键点
+  window.__parallax = {
+    eye, target, calib, params, state, camera, scene,
+    ingest: ingestLandmarks, loadSplat, startTracking, setTrack, setTrackDetail,
+    setModel: (bytes) => { manualModelBuffer = bytes; },
+  };
+}
+
+boot();
+</script>
+</body>
+</html>
