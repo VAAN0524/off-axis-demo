@@ -299,6 +299,7 @@ const state = {
   ipdPx: 0,
   pointerZ: 0.6,
   splat: null,
+  wasmBase: null,    // 这次是用哪档 wasm 起来的（诊断用）
 };
 
 /* ── 屏幕物理尺寸：由对角线 + 当前视口比例推出来 ────────────────── */
@@ -1109,7 +1110,82 @@ function wasmErrorText(e) {
   return e?.message || String(e);
 }
 
-/** ② MediaPipe 运行时：bundle 两源，wasm 三源，全部先摆好，实测哪个能起来 */
+/** 带进度、带超时（AbortController，不是 Promise.race，真能掐断请求）的二进制下载 */
+async function fetchBytes(url, { onProgress, timeout = 120000 } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('下载超时')), timeout);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const total = +res.headers.get('content-length') || 0;
+    if (!res.body) return new Uint8Array(await res.arrayBuffer());
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      onProgress?.(total ? got / total : 0, got, total);
+    }
+    const out = new Uint8Array(got);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 自己把 wasm 拉成 Blob，再手工拼一个 fileset 交给 MediaPipe。
+ *
+ * 为什么不直接把路径丢给 forVisionTasks：那样下载、超时、重试全在 emscripten
+ * 内部，我们既看不到进度，也没法在超时后干净地重来（半途被打断时它的内部
+ * 状态就坏了，只会抛 Aborted）。fileset 本身只是
+ *   { wasmLoaderPath, wasmBinaryPath }
+ * 两个字符串，换成 blob: URL 一样能用 —— 这两行是实测打出来的。
+ *
+ * 顺带解决三件事：能显示百分比；能在开跑前用魔数识别"下到一半的文件"；
+ * 换源重试时前一次的失败状态不会残留。
+ */
+const wasmFilesetCache = new Map();
+
+async function filesetFromBlob(mp, base, onProgress) {
+  // 页面加载会自动起一次追踪，用户再点「重启追踪」又是一次完整流程 ——
+  // 不缓存的话这 9.4MB 会实实在在下载两遍（实测过，transferSize 两条都是 9.4MB）
+  if (wasmFilesetCache.has(base)) {
+    onProgress?.(1);
+    return wasmFilesetCache.get(base);
+  }
+
+  // 让官方实现去判断该用 SIMD 版还是 nosimd 版，我们只接管"谁来下载"
+  const paths = await mp.FilesetResolver.forVisionTasks(base);
+
+  const jsBytes = await fetchBytes(paths.wasmLoaderPath, { timeout: 30000 });
+  onProgress?.(0.03);
+  const binBytes = await fetchBytes(paths.wasmBinaryPath, {
+    timeout: 120000,
+    onProgress: (f) => onProgress?.(0.03 + f * 0.97),
+  });
+
+  // wasm 魔数 \0asm —— 拿到的若是 404 页面或被截断的文件，在这里就能拦住，
+  // 不用等 emscripten 抛那句看不懂的 Aborted
+  if (!(binBytes[0] === 0x00 && binBytes[1] === 0x61 && binBytes[2] === 0x73 && binBytes[3] === 0x6d)) {
+    throw new Error('wasm 内容不对（不是 wasm 模块，' + binBytes.length + ' 字节）');
+  }
+
+  const fileset = {
+    wasmLoaderPath: URL.createObjectURL(new Blob([jsBytes], { type: 'text/javascript' })),
+    wasmBinaryPath: URL.createObjectURL(new Blob([binBytes], { type: 'application/wasm' })),
+  };
+  wasmFilesetCache.set(base, fileset);
+  return fileset;
+}
+
+/** ② MediaPipe 运行时：bundle 两源；wasm 只把可用基址列出来，下载留给 ④ 做 */
 async function loadRuntime() {
   let mp = null;
   const errs = [];
@@ -1123,19 +1199,9 @@ async function loadRuntime() {
   }
   if (!mp) throw new Error('MediaPipe 运行时脚本加载失败：' + errs.join('；'));
 
-  // forVisionTasks 只是拼路径 + 探测 SIMD 能力，不会真下载 wasm；
-  // 真正能不能用要等 createFromOptions，所以这里把候选全交出去挨个试。
-  const filesets = [];
-  for (const base of MP_WASM_BASES) {
-    if (base === 'wasm' && isFileProtocol()) continue; // file:// 下同源也读不到
-    try {
-      filesets.push({ base, fileset: await mp.FilesetResolver.forVisionTasks(base) });
-    } catch (e) {
-      errs.push(`${base}：${wasmErrorText(e)}`);
-    }
-  }
-  if (!filesets.length) throw new Error('MediaPipe wasm 路径都不可用：' + errs.join('；'));
-  return { mp, filesets };
+  // file:// 下同源文件也读不到（CORS），那一档直接跳过，别浪费一次超时
+  const bases = MP_WASM_BASES.filter((b) => !(b === 'wasm' && isFileProtocol()));
+  return { mp, bases };
 }
 
 /** base64 → Uint8Array（分块解码，5MB 也不会卡主线程太久） */
@@ -1242,26 +1308,34 @@ async function fetchModelBuffer() {
 }
 
 /**
- * ④ 建 landmarker：挨个 wasm 基址实测，第一个建起来的就留用。
+ * ④ 建 landmarker：每档 wasm 基址走一遍「自己下载 → 建实例」，第一个成功就留用。
  * 只用 CPU delegate —— GPU delegate 在部分驱动上会**静默卡死**（不报错、不返回），
  * 而检测本身是每 45ms 一次，CPU 在 M 系列上 6~8ms/帧完全够。
  */
-async function createLandmarker(mp, filesets, buffer, onTry) {
+async function createLandmarker(mp, bases, buffer, onStatus) {
   const opts = {
     baseOptions: { modelAssetBuffer: buffer, delegate: 'CPU' },
     runningMode: 'VIDEO',
     numFaces: 1,
   };
   const errs = [];
-  for (const { base, fileset } of filesets) {
+  for (const base of bases) {
     const local = base === 'wasm';
-    onTry?.(local ? '加载本地 wasm…' : '下载 wasm 9.4MB…');
+    let shown = -1;
     try {
-      // 本地副本秒开；走 CDN 要下 9.4MB，给足预算，别让它半路被超时砍掉
+      // 下载这一段自己管：9.4MB 在慢网络下要几十秒，必须让用户看见动
+      const fileset = await filesetFromBlob(mp, base, (f) => {
+        const pct = Math.round(f * 100);
+        if (pct === shown) return;          // 别每 64KB 就刷一次 DOM
+        shown = pct;
+        onStatus?.(`wasm ${pct}%`);
+      });
+      onStatus?.('初始化模型…');
+      // 到这一步 wasm 已经在本地了，只剩编译 + 建图，60s 绰绰有余
       const lm = await withTimeout(
         mp.FaceLandmarker.createFromOptions(fileset, opts),
-        local ? 20000 : 50000,
-        'wasm 初始化超时',
+        60000,
+        '模型初始化超时',
       );
       return { lm, base };
     } catch (e) {
@@ -1287,20 +1361,21 @@ async function startTracking() {
 
     setTrackDetail('摄像头已就绪，加载 MediaPipe 运行时…');
     setTrack('加载运行时…');
-    const { mp, filesets } = await loadRuntime();
+    const { mp, bases } = await loadRuntime();
 
     setTrackDetail('运行时已就绪，读取人脸模型…');
     setTrack('下载模型…');
     const buffer = await fetchModelBuffer();
 
-    const { lm } = await createLandmarker(mp, filesets, buffer, (t) => setTrack(t));
+    const { lm, base } = await createLandmarker(mp, bases, buffer, (t) => setTrack(t));
     landmarker = lm;
+    state.wasmBase = base;
 
     state.tracking = true;
     state.live = false;
     lastVideoTime = -1;
     setTrack('等待人脸', 'ok');
-    setTrackDetail('追踪已启用：脸进画面后按 C 校准中立位。');
+    setTrackDetail(`追踪已启用（wasm 来自${base === 'wasm' ? '本地副本' : 'CDN 兜底'}）：脸进画面后按 C 校准中立位。`);
     if (btn) { btn.disabled = false; btn.textContent = '重启追踪'; btn.classList.add('on'); }
     toast('追踪已启用，把脸放进画面，按 C 校准');
   } catch (err) {
