@@ -179,6 +179,58 @@ def tone_match(fill, rgb, hole, ring_px=22, sigma=11.0):
     return np.clip(fill + (low_out - low_fill), 0, 1)
 
 
+# ── 露出带/主体区：自相似纹理合成（PatchMatch 式贴片填充） ─────────────
+def texture_fill(rgb, src, hole, r=4, iters=3, max_src=1200, seed=0):
+    """
+    调和插值只能给出"边界色的最小曲率曲面"——雾。而这张照片里**砖墙、
+    木桌的真实纹理就在洞的四周**，根本不需要生成，只需要**借用**。
+
+    经典 PatchMatch 内容填充的紧凑版：
+    1. 从洞外真实像素里采样一批 9×9 贴片（墙面为主的区域自然占多数）；
+    2. 洞的初值用调和插值（低频对）；
+    3. 反复迭代：对洞内每个像素，用它当前 9×9 邻域与所有候选贴片算
+      L2，取最像的那片**中心像素**写回 —— 邻域在迭代中逐步被真实纹理
+      占领，低频雾被逐层替换成真砖缝/木纹；
+    4. 距离用 ||a||²+||b||²-2a·b 的矩阵乘法算，40k 像素 × 1200 候选
+      秒级完成。
+
+    洞只占总画面几个百分点，且四周全是同一面墙/同一张桌 —— 自相似
+    假设在这里近乎成立，不需要任何外部模型。
+    """
+    H, W = rgb.shape[:2]
+    out = harmonic_fill(rgb, src, max(24, 2 * r + 8))
+    p = 2 * r + 1
+    # 候选源：洞外、且 9×9 邻域完全在图内
+    inner = np.zeros((H, W), bool)
+    inner[r:H - r, r:W - r] = True
+    cy, cx = np.nonzero(src & inner)
+    if len(cy) > max_src:
+        sel = np.random.RandomState(seed).choice(len(cy), max_src, replace=False)
+        cy, cx = cy[sel], cx[sel]
+
+    def patches(yy, xx):
+        """取每个 (y,x) 的 p×p 邻域，摊平成 (n, p*p*3)。"""
+        n = len(yy)
+        buf = np.empty((n, p, p, 3), np.float32)
+        for dy in range(p):
+            for dx in range(p):
+                buf[:, dy, dx] = out[yy - r + dy, xx - r + dx]
+        return buf.reshape(n, -1)
+
+    cp = patches(cy, cx)                                # (Nc, F)
+    cp_sq = (cp * cp).sum(1)                            # (Nc,)
+    hy, hx = np.nonzero(hole)
+    chunk = max(1, int(2e7 // max(len(cy), 1)))         # 控制中间矩阵大小
+    for _ in range(iters):
+        for i in range(0, len(hy), chunk):
+            ph = patches(hy[i:i + chunk], hx[i:i + chunk])
+            ph_sq = (ph * ph).sum(1)
+            d = ph_sq[:, None] + cp_sq[None, :] - 2.0 * (ph @ cp.T)
+            best = np.argmin(d, 1)
+            out[hy[i:i + chunk], hx[i:i + chunk]] = out[cy[best], cx[best]]
+    return out
+
+
 # ── 露出带：调和插值（迭代扩散），边界条件 = 洞外真实像素 ─────────────
 def harmonic_fill(rgb, src, band, iters=24):
     """
@@ -491,8 +543,10 @@ def main():
                 # 还在 src 里 —— 调和插值就变成"墙 ↔ 笔电机身"的过渡，
                 # 补出一根比周围亮的竖条（左移时最显眼的那块）。
                 # 主体内部一律不可信，只留真背景当边界条件。
+                # 纹理合成填**整个 erase**：墙砖/木纹的真实贴片来自洞四周，
+                # bg.jpg 资产本身就是无残影、有纹理的完整背景板。
                 src = ~erase
-                fill = harmonic_fill(rgb, src, band)
+                fill = texture_fill(rgb, src, erase)
                 # 替换范围必须是**整个主体 + 3px**（erase），不能只是露出带
                 # （hole=ring 外扩 5px 只有一圈）。中心眼位时 subj.png 会盖住
                 # 主体，但它的 alpha 软边处是半透明的 —— bg 上若还留着笔电
