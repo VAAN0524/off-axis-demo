@@ -179,56 +179,81 @@ def tone_match(fill, rgb, hole, ring_px=22, sigma=11.0):
     return np.clip(fill + (low_out - low_fill), 0, 1)
 
 
-# ── 露出带/主体区：自相似纹理合成（PatchMatch 式贴片填充） ─────────────
-def texture_fill(rgb, src, hole, r=4, iters=3, max_src=1200, seed=0):
-    """
-    调和插值只能给出"边界色的最小曲率曲面"——雾。而这张照片里**砖墙、
-    木桌的真实纹理就在洞的四周**，根本不需要生成，只需要**借用**。
+# ── 露出带/主体区：图像拼贴纹理合成（Image Quilting，Efros & Freeman 2001） ──
+def texture_fill(rgb, src, hole, p=11, overlap=5, max_src=1500, seed=0):
+    """用照片里真实的墙/桌纹理，把被遮挡的背景**连贯地**补出来。
 
-    经典 PatchMatch 内容填充的紧凑版：
-    1. 从洞外真实像素里采样一批 9×9 贴片（墙面为主的区域自然占多数）；
-    2. 洞的初值用调和插值（低频对）；
-    3. 反复迭代：对洞内每个像素，用它当前 9×9 邻域与所有候选贴片算
-      L2，取最像的那片**中心像素**写回 —— 邻域在迭代中逐步被真实纹理
-      占领，低频雾被逐层替换成真砖缝/木纹；
-    4. 距离用 ||a||²+||b||²-2a·b 的矩阵乘法算，40k 像素 × 1200 候选
-      秒级完成。
+    上一版（逐像素找最像的贴片、只写回该贴片中心像素）是坏的：每个洞内像素
+    独立挑一个源贴片中心，相邻像素往往来自毫不相干的源位置，结果是一团
+    **高频噪点（像电视雪花）**，根本不是连续纹理——用户看到的"狗屎"就是它。
 
-    洞只占总画面几个百分点，且四周全是同一面墙/同一张桌 —— 自相似
-    假设在这里近乎成立，不需要任何外部模型。
+    本版用经典 Image Quilting：在洞上铺一张贴片网格（步长 p-overlap），逐片
+    光栅填充。每片只在"与已合成内容 + 真实边界的重叠区"上，从源贴片池里找
+    L2 最小的那片，整片写入、重叠处按最小误差边界羽化融合。纹理因此是
+    **连贯**的：墙还是墙、桌还是桌，与四周无缝衔接；洞只占几个百分点、四周
+    全是同种材质，自相似假设在此近乎成立，无需任何外部模型。
     """
     H, W = rgb.shape[:2]
-    out = harmonic_fill(rgb, src, max(24, 2 * r + 8))
-    p = 2 * r + 1
-    # 候选源：洞外、且 9×9 邻域完全在图内
-    inner = np.zeros((H, W), bool)
-    inner[r:H - r, r:W - r] = True
-    cy, cx = np.nonzero(src & inner)
-    if len(cy) > max_src:
-        sel = np.random.RandomState(seed).choice(len(cy), max_src, replace=False)
-        cy, cx = cy[sel], cx[sel]
+    # 边界保护：把图、洞、源各外扩 p，避免贴片窗口越过图像边
+    pad = p
+    rgb_p = np.pad(rgb, ((pad, pad), (pad, pad), (0, 0)), mode='edge')
+    hole_p = np.pad(hole, pad, mode='constant')
+    src_p = np.pad(src, pad, mode='constant')
+    Hp, Wp = rgb_p.shape[:2]
 
-    def patches(yy, xx):
-        """取每个 (y,x) 的 p×p 邻域，摊平成 (n, p*p*3)。"""
-        n = len(yy)
-        buf = np.empty((n, p, p, 3), np.float32)
-        for dy in range(p):
-            for dx in range(p):
-                buf[:, dy, dx] = out[yy - r + dy, xx - r + dx]
-        return buf.reshape(n, -1)
+    out = rgb_p.copy()
+    harm = harmonic_fill(rgb, src, max(24, p + 4))
+    harm_p = np.pad(harm, ((pad, pad), (pad, pad), (0, 0)), mode='edge')
+    out[hole_p] = harm_p[hole_p]
 
-    cp = patches(cy, cx)                                # (Nc, F)
-    cp_sq = (cp * cp).sum(1)                            # (Nc,)
-    hy, hx = np.nonzero(hole)
-    chunk = max(1, int(2e7 // max(len(cy), 1)))         # 控制中间矩阵大小
-    for _ in range(iters):
-        for i in range(0, len(hy), chunk):
-            ph = patches(hy[i:i + chunk], hx[i:i + chunk])
-            ph_sq = (ph * ph).sum(1)
-            d = ph_sq[:, None] + cp_sq[None, :] - 2.0 * (ph @ cp.T)
-            best = np.argmin(d, 1)
-            out[hy[i:i + chunk], hx[i:i + chunk]] = out[cy[best], cx[best]]
-    return out
+    # 源贴片池：洞外真实像素，p×p 完全落在图内
+    inner = np.zeros((Hp, Wp), bool)
+    inner[p // 2:Hp - p // 2, p // 2:Wp - p // 2] = True
+    sy, sx = np.nonzero(src_p & inner)
+    if len(sy) > max_src:
+        sel = np.random.RandomState(seed).choice(len(sy), max_src, replace=False)
+        sy, sx = sy[sel], sx[sel]
+    Ns = len(sy)
+    src_patches = np.empty((Ns, p, p, 3), np.float32)
+    for k in range(Ns):
+        src_patches[k] = rgb_p[sy[k] - p // 2: sy[k] + p // 2 + 1,
+                                sx[k] - p // 2: sx[k] + p // 2 + 1]
+
+    hy, hx = np.nonzero(hole_p)
+    y0, y1 = hy.min(), hy.max() + 1
+    x0, x1 = hx.min(), hx.max() + 1
+    step = p - overlap
+    ys = list(range(y0, y1, step)); xs = list(range(x0, x1, step))
+    if ys[-1] + p < y1: ys.append(y1 - p)
+    if xs[-1] + p < x1: xs.append(x1 - p)
+    ys = sorted(set(ys)); xs = sorted(set(xs))
+
+    ov_y, ov_x = np.ogrid[:p, :p]
+    row_ramp = np.clip((ov_y[:p] + 0.5) / overlap, 0, 1) if overlap else np.zeros(p)
+    col_ramp = np.clip((ov_x[:p] + 0.5) / overlap, 0, 1) if overlap else np.zeros(p)
+    wmask = np.maximum(row_ramp, col_ramp).astype(np.float32)   # (p,p) 重叠羽化权重
+
+    ov = np.zeros((p, p), bool)
+    if overlap:
+        ov[:overlap, :] = True
+        ov[:, :overlap] = True
+    oi = (ov.nonzero()[0], ov.nonzero()[1])
+    rng = np.random.RandomState(seed + 7)
+
+    for ty in ys:
+        for tx in xs:
+            wy = slice(ty, ty + p); wx = slice(tx, tx + p)
+            tgt = out[wy, wx]
+            tgt_ov = tgt[oi[0], oi[1]]                    # (nov,3)
+            sp_ov = src_patches[:, oi[0], oi[1], :]        # (Ns,nov,3)
+            d = ((sp_ov - tgt_ov[None]) ** 2).sum((1, 2))  # (Ns,)
+            k = min(6, Ns)
+            cand = np.argpartition(d, k - 1)[:k]
+            best = cand[rng.randint(len(cand))]
+            patch = src_patches[best]
+            out[wy, wx] = out[wy, wx] * (1 - wmask[..., None]) + patch * wmask[..., None]
+    out = out[pad:Hp - pad, pad:Wp - pad]
+    return np.clip(out, 0, 1)
 
 
 # ── 露出带：调和插值（迭代扩散），边界条件 = 洞外真实像素 ─────────────
@@ -543,8 +568,9 @@ def main():
                 # 还在 src 里 —— 调和插值就变成"墙 ↔ 笔电机身"的过渡，
                 # 补出一根比周围亮的竖条（左移时最显眼的那块）。
                 # 主体内部一律不可信，只留真背景当边界条件。
-                # 纹理合成填**整个 erase**：墙砖/木纹的真实贴片来自洞四周，
-                # bg.jpg 资产本身就是无残影、有纹理的完整背景板。
+                # 图像拼贴（Image Quilting）填**整个 erase**：墙砖/木纹的真实贴片
+                # 沿重叠区连贯拼合，bg.jpg 资产本身就是无残影、有连续纹理的
+                # 完整背景板（上一版的逐像素贴片法会产生雪花噪点，已废弃）。
                 src = ~erase
                 fill = texture_fill(rgb, src, erase)
                 # 替换范围必须是**整个主体 + 3px**（erase），不能只是露出带
