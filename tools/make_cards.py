@@ -84,33 +84,31 @@ def decontaminate(rgb, alpha, bg, lo=0.12, hi=0.995):
     return np.where(m, np.clip(f, 0, 1), rgb).astype(np.float32)
 
 
-# ── 外扩：LaMa 定调 + 镜像借高频 ──────────────────────────────────────
-def outpaint(lama, rgb, pad_x, pad_y, mirror_hf=0.5, sigma=9.0):
+# ── 外扩：边缘拉伸 + 递进模糊（延续但失焦） ────────────────────────────
+def outpaint(lama, rgb, pad_x, pad_y, mirror_hf=0.0, sigma=9.0):
     """
-    只靠 LaMa 外扩，出来是一条糊边（模型在 512 里看不到足够上下文）；
-    只靠镜像，出来是一次明显的翻折（边缘有强结构时像照镜子）。
+    之前两版外扩都被打脸：
 
-    合起来：LaMa 负责"颜色和走势对"，镜像的**高频**负责"质地是砖就还是砖"。
+    · symmetric 镜像 + 借镜像高频：桌面的斜纹木板被翻折成万花筒蝴蝶纹
+      （左右下角两块对称花纹），强结构边缘一眼假 —— 高频借得越足，镜像
+      结构越清楚，这是方法自带的，调 mirror_hf 救不了；
+    · 纯 LaMa 外扩：糊边，模型在 512 里看不到足够上下文。
 
-        ext = LaMa + (mirror - blur(mirror))
-
-    镜像用 symmetric（沿边框翻折，边界连续），所以高频那一项在接缝处为 0，
-    不会在接缝上画出硬线。
+    现在改「延续但失焦」：边缘像素向外拉伸（连续性最好，无翻折），
+    再按离边界的距离递进模糊 —— 近处还是锐的、越远越糊。移动眼位时
+    外扩区只在外围一瞥，**失焦的延续远比镜像结构不显眼**（摄影里
+    边缘失焦本来就是自然的）。
     """
     H, W = rgb.shape[:2]
-    canvas = np.pad(rgb, ((pad_y, pad_y), (pad_x, pad_x), (0, 0)), mode='symmetric')
-    ring = np.ones(canvas.shape[:2], bool)
-    ring[pad_y:pad_y + H, pad_x:pad_x + W] = False
-    if lama is None:
-        ext = canvas.copy()
-    else:
-        ext = B.align_low(lama(canvas, ring), canvas, ring)
-    if mirror_hf > 0:
-        low = np.stack([ndi.gaussian_filter(canvas[..., c], sigma) for c in range(3)], -1)
-        hf = (canvas - low) * mirror_hf
-        ext = np.clip(ext + hf, 0, 1)
+    canvas = np.pad(rgb, ((pad_y, pad_y), (pad_x, pad_x), (0, 0)), mode='edge')
+    dist = np.ones(canvas.shape[:2], np.float32)
+    dist[pad_y:pad_y + H, pad_x:pad_x + W] = 0.0
+    dist = ndi.distance_transform_edt(dist)
+    m = np.clip(dist / max(pad_x, pad_y, 1), 0, 1) ** 0.7      # 0=原像素 1=最外缘
+    low = np.stack([ndi.gaussian_filter(canvas[..., c], 28.0) for c in range(3)], -1)
+    ext = canvas * (1 - m[..., None]) + low * m[..., None]
     ext[pad_y:pad_y + H, pad_x:pad_x + W] = rgb
-    return ext.astype(np.float32)
+    return np.clip(ext, 0, 1).astype(np.float32)
 
 
 # ── 露出带：分块送模型，别整幅缩到 512 ────────────────────────────────
@@ -391,17 +389,39 @@ def main():
         lama = B.Lama(lama_path)
     pad_x, pad_y = int(round(W * pad)), int(round(H * pad))
     bg = rgb.copy()
+    # 洞/抹除范围——无论本地补全还是外部板子都要算，先算出来。
+    erase = hole = None
+    if subject.any():
+        erase = ndi.binary_dilation(subject, B.disk(3))
+        sp = band + 6
+        erase_pad = np.pad(erase, sp, constant_values=True)
+        dist_in = ndi.distance_transform_edt(erase_pad)[sp:-sp, sp:-sp]
+        ring = erase & (dist_in < ring_w)
+        hole = ndi.binary_dilation(ring, B.disk(5))
     if plate_path:
-        # 外部生成好的背景板：等比铺满"照片 + 外扩"这块画布，居中裁切。
-        # 它应该已经"没有主体、四周续过"，所以本地补全和外扩都跳过。
-        plate = Image.open(plate_path).convert('RGB')
-        tw, th = W + 2 * pad_x, H + 2 * pad_y
-        k = max(tw / plate.width, th / plate.height)
-        plate = plate.resize((max(tw, round(plate.width * k)),
-                              max(th, round(plate.height * k))), Image.LANCZOS)
-        cx, cy = (plate.width - tw) // 2, (plate.height - th) // 2
-        bg = np.asarray(plate.crop((cx, cy, cx + tw, cy + th)), np.float32) / 255.0
-        print(f'背景板：{plate_path}')
+        # 外部生成好的背景板（通常是文生/编辑模型把主体抹掉后重绘的图）。
+        # 关键架构：**板子只填洞内，洞外保持原像素**。
+        #   · 生成图和原图不可能像素级对齐，整块替换会在边界穿帮；
+        #   · 洞外本来就是真实像素，没必要动；
+        #   · 只在会露出的 hole 区域用板子纹理，羽化融合。
+        # 再做一次色彩迁移：以洞外原图为参考，把板子的均值/方差对齐过去，
+        # 消除"生成图整体偏亮/偏暖"导致的接缝。
+        plate = Image.open(plate_path).convert('RGB').resize((W, H), Image.LANCZOS)
+        plate = np.asarray(plate, np.float32) / 255.0
+        if subject.any():
+            ref = ~erase
+            for c in range(3):
+                m0, s0 = rgb[..., c][ref].mean(), rgb[..., c][ref].std() + 1e-6
+                m1, s1 = plate[..., c][ref].mean(), plate[..., c][ref].std() + 1e-6
+                plate[..., c] = (plate[..., c] - m1) * (s0 / s1) + m0
+            plate = np.clip(plate, 0, 1)
+            # 写回整个主体区（不只是露出带）：生成板全图都有纹理，整块替换
+            # 后 bg.jpg 资产本身就没有残影；边界靠色彩迁移 + 2px 羽化兜住。
+            w = np.clip(ndi.gaussian_filter(erase.astype(np.float32), 2.0), 0, 1)
+            bg = rgb * (1 - w[..., None]) + plate * w[..., None]
+        else:
+            bg = plate
+        print(f'背景板：{plate_path}（洞内生成·洞外原图·色彩迁移）')
     else:
         if subject.any():
             # 只修"轮廓内侧 band 宽的一圈"。
@@ -422,23 +442,7 @@ def main():
             # 斜边就从背景里浮出来（放大看是断续的点，因为遮罩边界是像素锯齿）。
             #
             # alpha 仍然用原遮罩，所以卡片剪影一点都不变。
-            erase = ndi.binary_dilation(subject, B.disk(3))
-            sp = band + 6
-            erase_pad = np.pad(erase, sp, constant_values=True)
-            dist_in = ndi.distance_transform_edt(erase_pad)[sp:-sp, sp:-sp]
-            ring = erase & (dist_in < ring_w)
-
-            # 替换边界必须**离开轮廓** 5px。
-            #
-            # 严格的替换边界就是遮罩边界，而遮罩是像素级的 —— 边界本身带
-            # 1px 锯齿。就算两测色差只有 5%，那条锯齿在放大后也是一条断续的
-            # 虚线（就是"边缘一圈毛"的最后一层来源）。把边界推到轮廓外 5px
-            # 的墙里，两测就都是墙色，锯齿无从显现。
-            #
-            # 代价：轮廓外 5px 的墙是补的，静止时那 5px 与原图差百分之几。
-            # 但卡片 alpha 在最外 2px 就掉到 0 了，decontaminate 又把 a>0.12
-            # 的那段反解回原值 —— 真正裸奔的只有 1~2px，肉眼不可见。
-            hole = ndi.binary_dilation(ring, B.disk(5))
+            # （erase/ring/hole 已在上方统一计算。）
             if '--debug' in sys.argv:
                 sy, sx = np.nonzero(subject)
                 md = float(np.median(d[obj])) if obj.any() else -1
