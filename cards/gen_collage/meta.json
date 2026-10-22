@@ -1,0 +1,47 @@
+{
+ "version": 3,
+ "mode": "cards",
+ "image": {
+  "w": 1024,
+  "h": 768
+ },
+ "scene": {
+  "zRef": 0.6,
+  "halfWM": 0.35,
+  "eyeMax": 0.075
+ },
+ "pad": {
+  "x": 0,
+  "y": 0
+ },
+ "layers": [
+  {
+   "id": "bg",
+   "file": "bg.png",
+   "z": 1.6,
+   "order": 0,
+   "rect": [
+    0,
+    0,
+    1024,
+    768
+   ]
+  },
+  {
+   "id": "subj",
+   "file": "subj.png",
+   "z": 0.35,
+   "order": 1,
+   "rect": [
+    0,
+    0,
+    1024,
+    768
+   ]
+  }
+ ],
+ "qa": {
+  "source": "flux 客厅 + qwen rgba 花瓶",
+  "note": "生成式双卡"
+ }
+}

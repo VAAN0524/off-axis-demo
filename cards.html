@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>卡片栈离轴视差 · 原型</title>
+<title>卡片栈离轴视差 · 眼部随动</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -37,6 +37,15 @@
   button[aria-pressed=true] { background: #e8ecf2; color: #14171c; border-color: transparent; }
   .err { position: fixed; inset: 0; display: grid; place-items: center; text-align: center;
     color: #ff9b9b; font-size: 14px; padding: 30px; }
+
+  #camwrap { position: fixed; right: 14px; top: 14px; width: 128px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,.14); overflow: hidden; display: none;
+    box-shadow: 0 4px 18px rgba(0,0,0,.45); }
+  #camwrap.show { display: block; }
+  #cam { width: 100%; display: block; transform: scaleX(-1); }
+  #camstat { position: absolute; left: 0; right: 0; bottom: 0; padding: 2px 6px;
+    font-size: 11px; text-align: center; color: #dfe5ee;
+    background: rgba(10,12,16,.62); backdrop-filter: blur(6px); }
 </style>
 </head>
 <body>
@@ -46,11 +55,16 @@
   <div><b>卡片栈</b> · <span id="mode">—</span></div>
   <div class="row"><span id="eyelab">眼位 0.0 / 0.0 cm</span><span id="fpslab">— fps</span></div>
   <div class="row"><span id="padlab">—</span></div>
+  <div class="row"><span id="tracklab">追踪未启用 · 鼠标模式</span></div>
 </div>
+
+<div id="camwrap"><video id="cam" playsinline muted></video><div id="camstat">—</div></div>
 
 <div class="bar">
   <label>眼位</label>
   <input id="eye" type="range" min="-100" max="100" value="0">
+  <button id="dof" aria-pressed="true">虚化</button>
+  <button id="camtrack" aria-pressed="false">摄像头随动</button>
   <button id="swing" aria-pressed="false">自动摆动</button>
   <button id="zero">回中</button>
 </div>
@@ -59,26 +73,27 @@
 /* ─────────────────────────────────────────────────────────────────────
  * 卡片栈渲染：每层是**一块刚体平面**，整层只做平移，层内不采样深度。
  *
- * 为什么要这样：一块正对镜头的平面，在针孔相机下眼睛横移 E 时，
- * 屏幕位移严格等于
- *
  *     shift = E · k · zRef / (zRef + z)          （k = 每米多少像素）
  *
  * 全层同一个 z，所以全层同一个位移 —— 纯平移，没有任何形变。
- * 这就是"层内零扭曲"的来源，不是近似省事，是这块平面本来就没有变形。
  *
- * 而 LDI 网格给每个顶点各自一个 z（把逐像素深度搬进几何），
- * 相邻顶点位移不同 → 三角形被剪切；轮廓两侧顶点 z 差一大截 →
- * 那个三角形被拉成橡皮布，颜色跨轮廓互相渗透。扭曲和锯齿都是这么来的。
+ * 背景防露边（双保险，任何眼位下背景都不超出视口）：
+ *   ① 预支预算：覆盖视口的层，源矩形不变、目标矩形四周外扩该层的
+ *      最大位移 budget = k·EYE_MAX·par。等于把这张图轻微放大、预先
+ *      把位移空间腾出来 —— 之后眼位怎么动，露出来的都是图，不是底色。
+ *      代价只是背景构图放大约 4~7%，肉眼几乎不可察。
+ *   ② 硬钳制：算出的位移再钳回 [视口右缘-层右缘, 视口左缘-层左缘]，
+ *      就算眼位被外部脚本推超限也不会露边。
  * ───────────────────────────────────────────────────────────────────── */
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { alpha: false });
 
 const params = new URLSearchParams(location.search);
-const DIR = params.get('cards') || 'cards/near';
+const DIR = params.get('cards') || 'cards/gen_living';
 const HALF_W_M = 0.35;      // 屏幕半宽（米），与烘焙脚本对齐
-const EYE_MAX = 0.075;      // 眼位横移上限
-const Z_REF = 0.60;         // 参考眼距
+const EYE_MAX = 0.075;      // 眼位横移上限（米）
+const EYE_Y_MAX = EYE_MAX * 0.6;  // 眼位纵移上限（米）
+const Z_REF = 0.60;         // 参考眼距（米）
 
 const S = { meta: null, layers: [], eye: { x: 0, y: 0 }, target: { x: 0, y: 0 },
             swing: false, t: 0, w: 0, h: 0, dpr: 1 };
@@ -86,6 +101,240 @@ window.__cards = S;          // 便于外部脚本推到指定眼位截图
 const img = {};
 let edgeColor = '#101318';
 
+/* ── One Euro 滤波器：低速重平滑、高速低延迟 ── */
+class OneEuroFilter {
+  constructor(minCutoff = 2, beta = 0.8, dCutoff = 1) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.xPrev = null; this.dxPrev = 0;
+  }
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  filter(x, dt) {
+    if (this.xPrev === null) { this.xPrev = x; return x; }
+    const dx = (x - this.xPrev) / dt;
+    const aD = OneEuroFilter.alpha(this.dCutoff, dt);
+    this.dxPrev = aD * dx + (1 - aD) * this.dxPrev;
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dxPrev);
+    const a = OneEuroFilter.alpha(cutoff, dt);
+    this.xPrev = a * x + (1 - a) * this.xPrev;
+    return this.xPrev;
+  }
+  reset(v = null) { this.xPrev = v; this.dxPrev = 0; }
+}
+const fx = new OneEuroFilter(), fy = new OneEuroFilter();
+
+/* ══════════════════════════════════════════════════════════════════
+   摄像头眼部随动：MediaPipe FaceLandmarker（虹膜中心 + 瞳距测距）
+   本地 wasm/ 与 models/face_landmarker.task 同源自带，断网也能起；
+   CDN 只做兜底。任何一环失败 → 自动回鼠标模式，不打断使用。
+   ══════════════════════════════════════════════════════════════════ */
+const MP_VERSION = '0.10.14';
+const NPMMIRROR = `https://registry.npmmirror.com/@mediapipe/tasks-vision/${MP_VERSION}/files`;
+const MP_BUNDLES = [
+  `${NPMMIRROR}/vision_bundle.mjs`,
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`,
+];
+const MP_WASM_BASES = ['wasm', `${NPMMIRROR}/wasm`,
+  `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`];
+const MODEL_SOURCES = [
+  { label: '本地', url: 'models/face_landmarker.task' },
+  { label: 'Google', url: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' },
+];
+
+const TR = {
+  on: false, starting: false, mode: 'pointer', live: false,
+  video: null, landmarker: null, stream: null,
+  lastVideoTime: -1, lastDetectAt: 0, detectEvery: 45,
+  calib: { ready: false, cx: 0.5, cy: 0.5, ipd: 0 },
+};
+
+function trackStat(t, cls) {
+  document.getElementById('tracklab').textContent = t;
+  document.getElementById('camstat').textContent = t;
+}
+
+function withTimeout(p, ms, why) {
+  return Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(why)), ms)),
+  ]);
+}
+
+async function downloadBytes(url, { timeout = 30000, onProgress } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const total = +r.headers.get('Content-Length') || 0;
+    if (!r.body) return new Uint8Array(await r.arrayBuffer());
+    const reader = r.body.getReader();
+    const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      onProgress?.(total ? got / total : 0);
+    }
+    const out = new Uint8Array(got);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
+  } finally { clearTimeout(timer); }
+}
+
+async function loadRuntime() {
+  let mp = null; const errs = [];
+  for (const url of MP_BUNDLES) {
+    try { mp = await withTimeout(import(url), 15000, '运行时脚本下载超时'); break; }
+    catch (e) { errs.push(e?.message || String(e)); }
+  }
+  if (!mp) throw new Error('运行时脚本加载失败：' + errs.join('；'));
+  return mp;
+}
+
+/** wasm 基址逐个试，第一个能把 landmarker 建起来的才算数 */
+async function createLandmarker(mp, onStatus) {
+  const errs = [];
+  for (const base of MP_WASM_BASES) {
+    try {
+      onStatus?.('初始化模型…');
+      const fileset = await mp.FilesetResolver.forVisionTasks(base);
+      const lm = await withTimeout(
+        mp.FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetBuffer: TR.modelBuf, delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          numFaces: 1,
+        }),
+        90000, '模型初始化超时');
+      return lm;
+    } catch (e) { errs.push(e?.message || String(e)); }
+  }
+  throw new Error('wasm 运行时全部失败：' + errs.join('；'));
+}
+
+async function fetchModelBuffer(onStatus) {
+  const fails = [];
+  for (const src of MODEL_SOURCES) {
+    try {
+      onStatus?.(`下载模型（${src.label}）…`);
+      const buf = await downloadBytes(src.url, {
+        timeout: 45000,
+        onProgress: f => onStatus?.(`模型 ${Math.round(f * 100)}%`),
+      });
+      if (!buf || buf.length < 100000) throw new Error('内容不完整');
+      return buf;
+    } catch (e) { fails.push(`${src.label}：${e?.message || e}`); }
+  }
+  throw new Error('人脸模型读取失败（' + fails.join('；') + '）');
+}
+
+/** 启动 / 停止摄像头随动 */
+async function toggleCamTrack() {
+  if (TR.starting) return;
+  const btn = document.getElementById('camtrack');
+  if (TR.on) {                                 // 关闭：释放摄像头，回鼠标模式
+    TR.on = false; TR.mode = 'pointer'; TR.live = false;
+    TR.stream?.getTracks().forEach(t => t.stop());
+    TR.stream = null; TR.landmarker = null;
+    document.getElementById('camwrap').classList.remove('show');
+    btn.setAttribute('aria-pressed', 'false');
+    trackStat('追踪未启用 · 鼠标模式');
+    return;
+  }
+  TR.starting = true;
+  btn.disabled = true;
+  try {
+    trackStat('请求摄像头…');
+    TR.stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: 'user' }, audio: false,
+    });
+    TR.video = document.getElementById('cam');
+    TR.video.srcObject = TR.stream;
+    await TR.video.play();
+    document.getElementById('camwrap').classList.add('show');
+
+    trackStat('加载运行时…');
+    const mp = await loadRuntime();
+    TR.modelBuf = await fetchModelBuffer(t => trackStat(t));
+    TR.landmarker = await createLandmarker(mp, t => trackStat(t));
+
+    TR.on = true; TR.mode = 'cam';
+    btn.setAttribute('aria-pressed', 'true');
+    S.swing = false;
+    document.getElementById('swing').setAttribute('aria-pressed', 'false');
+    fx.reset(0); fy.reset(0);
+    trackStat('等待人脸 · 检测到后自动校准');
+  } catch (err) {
+    console.warn('[track]', err);
+    TR.stream?.getTracks().forEach(t => t.stop());
+    TR.stream = null;
+    document.getElementById('camwrap').classList.remove('show');
+    trackStat('摄像头随动不可用：' + (err?.message || err) + ' · 已保持鼠标模式');
+  } finally {
+    TR.starting = false;
+    btn.disabled = false;
+  }
+}
+
+/** 每帧最多检测一次（不重复喂同一帧）；推理耗时自适应降频 */
+function pullCameraFrame(now) {
+  if (!TR.on || !TR.landmarker || !TR.video || TR.video.readyState < 2) return;
+  if (TR.video.currentTime === TR.lastVideoTime) return;
+  if (now - TR.lastDetectAt < TR.detectEvery) return;
+  TR.lastVideoTime = TR.video.currentTime;
+  TR.lastDetectAt = now;
+
+  let res;
+  try { res = TR.landmarker.detectForVideo(TR.video, now); } catch { return; }
+  TR.detectEvery = Math.min(200, Math.max(40, (performance.now() - now) * 3));
+
+  const lm = res?.faceLandmarks?.[0];
+  if (!lm || lm.length < 400) { TR.live = false; trackStat('等待人脸 · 检测到后自动校准'); return; }
+  TR.live = true;
+  ingestLandmarks(lm, now);
+}
+
+/** 468/478 关键点 → 眼睛在屏幕前的 (x, y) 米；首次检测到脸即校准中立位 */
+function ingestLandmarks(lm, now) {
+  const vw = TR.video.videoWidth || 640;
+  const vh = TR.video.videoHeight || 480;
+
+  let cx, cy, ipdPx;
+  if (lm.length > 472) {
+    // 虹膜中心（468 左 / 473 右）最稳；IPD 同时用来测距
+    const a = lm[468], b = lm[473];
+    cx = (a.x + b.x) * 0.5; cy = (a.y + b.y) * 0.5;
+    ipdPx = Math.hypot((b.x - a.x) * vw, (b.y - a.y) * vh);
+  } else {
+    const lo = lm[33], li = lm[133], ri = lm[362], ro = lm[263];
+    cx = (lo.x + li.x + ri.x + ro.x) * 0.25;
+    cy = (lo.y + li.y + ri.y + ro.y) * 0.25;
+    ipdPx = Math.hypot((ro.x - lo.x) * vw, (ro.y - lo.y) * vh);
+  }
+  cx = 1 - cx;                                 // 摄像头是镜像的：画面右 = 人往右
+
+  const c = TR.calib;
+  if (!c.ready) { c.cx = cx; c.cy = cy; c.ipd = ipdPx; c.z = Z_REF; c.ready = true; }
+
+  // 针孔模型：IPD 变大 → 人近了；同一角度偏移，离得越远物理位移越大
+  const z = Math.min(2.5, Math.max(0.25, c.z * c.ipd / ipdPx));
+  const kx = 2 * Math.tan((62 * Math.PI / 180) / 2) * z;   // 摄像头水平 FOV ≈ 62°
+  const ky = kx * (vh / vw);
+
+  const tx = (cx - c.cx) * kx;
+  const ty = (c.cy - cy) * ky;
+  const dt = Math.min(0.2, Math.max(0.001, (now - TR.lastDetectAt) / 1000 + 0.016));
+  S.target.x = Math.min(EYE_MAX, Math.max(-EYE_MAX, fx.filter(tx, dt)));
+  S.target.y = Math.min(EYE_Y_MAX, Math.max(-EYE_Y_MAX, fy.filter(ty, dt)));
+  trackStat(`眼部随动中 · ${Math.round(ipdPx)}px`);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   加载与渲染
+   ══════════════════════════════════════════════════════════════════ */
 function load(url) {
   return new Promise((res, rej) => {
     const im = new Image();
@@ -111,8 +360,52 @@ async function boot() {
   await Promise.all(files.map(async f => { img[f] = await load(DIR + '/' + f); }));
 
   S.layers = meta.layers.slice().sort((a, b) => a.order - b.order);
+
+  // 虚化层预烘焙：blurPx 在层上声明（图像像素）。
+  // 直接模糊原图会让四边发透明（高斯核越出图边），所以先做**边缘钳位**——
+  // 四边/四角用 1px 边缘拉伸铺满 pad 区——再整体 blur 一次烘焙成离屏画布。
+  // 运行时只是换张源图 blit，零逐帧模糊成本；blurPx 定在图像像素上，
+  // 与视口尺寸无关，窗口缩放不需要重烘焙。
+  S.hasDof = false;
+  if (typeof document.createElement('canvas').getContext('2d').filter === 'string') {
+    for (const L of S.layers) {
+      if (!L.blurPx) continue;
+      S.hasDof = true;
+      const im = img[L.file], W = im.naturalWidth, H = im.naturalHeight;
+      const pad = Math.ceil(L.blurPx * 3);
+      const c0 = document.createElement('canvas');
+      c0.width = W + 2 * pad; c0.height = H + 2 * pad;
+      const g0 = c0.getContext('2d');
+      g0.drawImage(im, pad, pad);
+      g0.drawImage(im, 0, 0, 1, H, 0, pad, pad, H);
+      g0.drawImage(im, W - 1, 0, 1, H, pad + W, pad, pad, H);
+      g0.drawImage(im, 0, 0, W, 1, pad, 0, W, pad);
+      g0.drawImage(im, 0, H - 1, W, 1, pad, pad + H, W, pad);
+      g0.drawImage(im, 0, 0, 1, 1, 0, 0, pad, pad);
+      g0.drawImage(im, W - 1, 0, 1, 1, pad + W, 0, pad, pad);
+      g0.drawImage(im, 0, H - 1, 1, 1, 0, pad + H, pad, pad);
+      g0.drawImage(im, W - 1, H - 1, 1, 1, pad + W, pad + H, pad, pad);
+      const c1 = document.createElement('canvas');
+      c1.width = c0.width; c1.height = c0.height;
+      const g1 = c1.getContext('2d');
+      g1.filter = `blur(${L.blurPx}px)`;
+      g1.drawImage(c0, 0, 0);
+      L.bit = { img: c1, x: L.rect[0] - pad, y: L.rect[1] - pad,
+                w: L.rect[2] + 2 * pad, h: L.rect[3] + 2 * pad };
+    }
+  }
+  S.dof = S.hasDof && params.get('blur') !== '0';
+  const dofBtn = document.getElementById('dof');
+  dofBtn.style.display = S.hasDof ? '' : 'none';
+  dofBtn.setAttribute('aria-pressed', String(S.dof));
+  dofBtn.addEventListener('click', () => {
+    S.dof = !S.dof;
+    dofBtn.setAttribute('aria-pressed', String(S.dof));
+  });
+
   document.getElementById('mode').textContent =
-    S.layers.length + ' 层 · ' + meta.image.w + '×' + meta.image.h;
+    S.layers.length + ' 层 · ' + meta.image.w + '×' + meta.image.h
+    + (S.hasDof ? ' · 景深' : '');
   const qa = meta.qa || {};
   document.getElementById('padlab').textContent =
     '露出 ' + Math.round(qa.reveal_px || 0) + 'px / 外扩 ' + (qa.pad_px || 0) + 'px'
@@ -129,6 +422,7 @@ async function boot() {
   resize();
   addEventListener('resize', resize);
   bindInput();
+  document.getElementById('camtrack').addEventListener('click', toggleCamTrack);
   requestAnimationFrame(loop);
 }
 
@@ -148,18 +442,44 @@ function frame() {
 
 function draw() {
   const { s, ox, oy } = frame();
-  const k = S.w / (2 * HALF_W_M);          // 每米像素（按屏幕宽度算）
+  const k = S.w / (2 * HALF_W_M);
   ctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
   ctx.fillStyle = edgeColor;
   ctx.fillRect(0, 0, S.w, S.h);
 
+  let backingTaken = false;
   for (const L of S.layers) {
     const par = Z_REF / (Z_REF + L.z);     // 视差系数：0=像贴在屏幕，1=极近
-    const dx = -S.eye.x * k * par;
-    const dy = -S.eye.y * k * par;
-    const [rx, ry, rw, rh] = L.rect;
-    ctx.drawImage(img[L.file],
-      ox + rx * s + dx, oy + ry * s + dy, rw * s, rh * s);
+    let dx = -S.eye.x * k * par;
+    let dy = -S.eye.y * k * par;
+    // 虚化位图的 rect 自带 pad（钳位边），pad 余量自动并入背景板的位移预算
+    const bit = S.dof && L.bit;
+    const [rx, ry, rw, rh] = bit ? [bit.x, bit.y, bit.w, bit.h] : L.rect;
+    const srcImg = bit ? bit.img : img[L.file];
+    const x0 = ox + rx * s, y0 = oy + ry * s;
+    const w = rw * s, h = rh * s;
+
+    // 背景板（绘制顺序里第一块横竖都盖住视口的层）双保险：
+    //   ① 预支预算：烘焙外扩（pad）不够的部分，目标矩形按缺口补足 ——
+    //      等效轻微放大背景板，把位移空间预先腾出来；
+    //   ② 硬钳制：位移钳回 ±budget，眼位被推超限也不露底色。
+    // 露出来的永远是图，不是底色 —— 任何眼位下背景都不超出视口。
+    if (w >= S.w && h >= S.h && !backingTaken) {
+      backingTaken = true;
+      const bx = Math.max(2, k * EYE_MAX * par);
+      const by = Math.max(2, k * EYE_Y_MAX * par);
+      const exL = Math.max(0, bx - (-x0));          // 左侧烘焙余量的缺口
+      const exR = Math.max(0, bx - (x0 + w - S.w));
+      const exT = Math.max(0, by - (-y0));
+      const exB = Math.max(0, by - (y0 + h - S.h));
+      dx = Math.min(Math.max(dx, S.w - x0 - w - exR), -x0 + exL);
+      dy = Math.min(Math.max(dy, S.h - y0 - h - exB), -y0 + exT);
+      ctx.drawImage(srcImg,
+        x0 - exL + dx, y0 - exT + dy, w + exL + exR, h + exT + exB);
+    } else {
+      // 其余层纯平移 —— 刚体卡片，露出的区域由背景板兜底
+      ctx.drawImage(srcImg, x0 + dx, y0 + dy, w, h);
+    }
   }
 }
 
@@ -168,24 +488,28 @@ function loop(now) {
   const dt = Math.min(64, now - last); last = now;
   ema = ema * 0.9 + dt * 0.1;
   S.t += dt / 1000;
-  if (S.swing) {
+  if (TR.mode === 'cam') {
+    pullCameraFrame(now);
+  } else if (S.swing) {
     S.target.x = Math.sin(S.t * 0.9) * EYE_MAX;
-    S.target.y = Math.sin(S.t * 0.62 + 1.1) * EYE_MAX * 0.45;
+    S.target.y = Math.sin(S.t * 0.62 + 1.1) * EYE_Y_MAX * 0.75;
   }
   const a = 1 - Math.pow(0.0015, dt / 1000);   // 与帧率无关的指数平滑
   S.eye.x += (S.target.x - S.eye.x) * a;
   S.eye.y += (S.target.y - S.eye.y) * a;
   draw();
   document.getElementById('eyelab').textContent =
-    `眼位 ${(S.eye.x * 100).toFixed(1)} / ${(S.eye.y * 100).toFixed(1)} cm`;
+    `眼位 ${(S.eye.x * 100).toFixed(1)} / ${(S.eye.y * 100).toFixed(1)} cm`
+    + (TR.mode === 'cam' ? (TR.live ? ' · 随动' : ' · 无人') : '');
   document.getElementById('fpslab').textContent = Math.round(1000 / ema) + ' fps';
   requestAnimationFrame(loop);
 }
 
 function bindInput() {
   const setFrom = (cx, cy) => {
+    if (TR.mode === 'cam') return;             // 随动开启后鼠标不再抢眼位
     S.target.x = (cx / S.w - 0.5) * 2 * EYE_MAX;
-    S.target.y = -(cy / S.h - 0.5) * 2 * EYE_MAX * 0.6;
+    S.target.y = -(cy / S.h - 0.5) * 2 * EYE_Y_MAX;
     S.swing = false;
     document.getElementById('swing').setAttribute('aria-pressed', 'false');
     document.getElementById('eye').value = Math.round(S.target.x / EYE_MAX * 100);
@@ -195,29 +519,40 @@ function bindInput() {
     if (e.touches[0]) setFrom(e.touches[0].clientX, e.touches[0].clientY);
   }, { passive: true });
   document.getElementById('eye').addEventListener('input', e => {
+    if (TR.mode === 'cam') return;
     S.target.x = e.target.value / 100 * EYE_MAX; S.swing = false;
     document.getElementById('swing').setAttribute('aria-pressed', 'false');
   });
   document.getElementById('swing').addEventListener('click', e => {
+    if (TR.mode === 'cam') { toastCamBusy(); return; }
     S.swing = !S.swing;
     e.currentTarget.setAttribute('aria-pressed', String(S.swing));
   });
   document.getElementById('zero').addEventListener('click', () => {
+    if (TR.mode === 'cam') { TR.calib.ready = false; fx.reset(0); fy.reset(0); return; }
     S.target.x = S.target.y = 0; S.swing = false;
     document.getElementById('swing').setAttribute('aria-pressed', 'false');
     document.getElementById('eye').value = 0;
   });
   addEventListener('keydown', e => {
+    if (TR.mode === 'cam') return;
     const step = e.shiftKey ? EYE_MAX : EYE_MAX * 0.35;
     if (e.key === 'ArrowLeft') S.target.x -= step;
     else if (e.key === 'ArrowRight') S.target.x += step;
-    else if (e.key === 'ArrowUp') S.target.y += step * 0.6;
+    else if (e.key === 'ArrowUp') S.target.y += step * 0.6;  /* 纵向手感略缓 */
     else if (e.key === 'ArrowDown') S.target.y -= step * 0.6;
     else return;
     S.target.x = Math.max(-EYE_MAX, Math.min(EYE_MAX, S.target.x));
     S.swing = false;
     document.getElementById('swing').setAttribute('aria-pressed', 'false');
   });
+}
+
+let camBusyToastAt = 0;
+function toastCamBusy() {
+  if (performance.now() - camBusyToastAt < 2500) return;
+  camBusyToastAt = performance.now();
+  trackStat('随动模式中 · 点「摄像头随动」关闭后再用鼠标/摆动');
 }
 
 boot();
